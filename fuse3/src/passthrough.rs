@@ -15,7 +15,7 @@ use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use typed_fuse_core::{Caller, Errno, FileKind, NodeAttr};
+use typed_fuse_core::{Caller, Errno, FileKind, NodeAttr, StatFs};
 
 // ---------------------------------------------------------------------------
 // Attribute conversions
@@ -109,6 +109,28 @@ pub fn synthetic_file_attr(
         flags: 0,
         blksize: 4096,
     }
+}
+
+/// Query filesystem-wide statistics for the filesystem backing `path`
+/// (`statvfs(2)`). The field-width casts here absorb the Linux/macOS
+/// `statvfs` layout differences.
+pub fn statfs_path(path: &Path) -> Result<StatFs, Errno> {
+    let c_path = c_path(path)?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if ret != 0 {
+        return Err(last_errno());
+    }
+    Ok(StatFs {
+        blocks: stat.f_blocks as u64,
+        bfree: stat.f_bfree as u64,
+        bavail: stat.f_bavail as u64,
+        files: stat.f_files as u64,
+        ffree: stat.f_ffree as u64,
+        bsize: stat.f_bsize as u32,
+        namelen: stat.f_namemax as u32,
+        frsize: stat.f_frsize as u32,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +302,40 @@ pub fn is_apple_xattr(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 // POSIX permission checks
 // ---------------------------------------------------------------------------
+
+/// POSIX `access(2)` permission check: selects the owner/group/other mode
+/// triplet based on the caller's uid/gid versus the file's, and verifies the
+/// requested `mask` (`R_OK`/`W_OK`/`X_OK` bits) against it. Root always
+/// passes; `mask == 0` (`F_OK`) only checks existence, which callers signal
+/// by not calling this at all — kept here as an explicit early-out since the
+/// mask still arrives as a bitmask that may legitimately be zero.
+pub fn access_check(
+    caller: &Caller,
+    file_uid: u32,
+    file_gid: u32,
+    mode: u32,
+    mask: u32,
+) -> Result<(), Errno> {
+    if mask == 0 {
+        return Ok(());
+    }
+    if caller.uid == 0 {
+        return Ok(());
+    }
+    let effective = if caller.uid == file_uid {
+        (mode >> 6) & 0o7
+    } else if caller.gid == file_gid {
+        (mode >> 3) & 0o7
+    } else {
+        mode & 0o7
+    };
+    let need = mask & 0o7;
+    if (effective & need) == need {
+        Ok(())
+    } else {
+        Err(Errno::EACCES)
+    }
+}
 
 /// POSIX utimens permission check: the owner and root may always set times;
 /// others may set both times to the current time only if they have write
@@ -505,6 +561,21 @@ pub fn mknod(path: &Path, mode: u32, rdev: u32) -> Result<(), Errno> {
     }
 }
 
+/// Create a symlink at `link` pointing to `target`, an arbitrary byte string
+/// (not necessarily valid UTF-8/`Path` syntax). Passthrough filesystems that
+/// transform symlink targets (e.g. encrypt them) need this instead of
+/// `std::os::unix::fs::symlink`, which requires target to look like a path.
+pub fn symlink(target: &OsStr, link: &Path) -> Result<(), Errno> {
+    let c_target = CString::new(target.as_bytes()).map_err(|_| Errno::EINVAL)?;
+    let c_link = c_path(link)?;
+    let ret = unsafe { libc::symlink(c_target.as_ptr(), c_link.as_ptr()) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(last_errno())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,5 +652,69 @@ mod tests {
         assert_eq!(attr.kind, FileKind::RegularFile);
         assert_eq!(attr.blocks, 1);
         assert_eq!(attr.perm, 0o644);
+    }
+
+    #[test]
+    fn access_check_root_always_allowed() {
+        let root = Caller::default();
+        assert!(access_check(&root, 1000, 1000, 0o000, libc::R_OK as u32).is_ok());
+    }
+
+    #[test]
+    fn access_check_f_ok_only_checks_existence() {
+        let other = Caller {
+            uid: 2000,
+            gid: 2000,
+            ..Default::default()
+        };
+        assert!(access_check(&other, 1000, 1000, 0o000, 0).is_ok());
+    }
+
+    #[test]
+    fn access_check_selects_owner_group_other_triplet() {
+        let owner = Caller {
+            uid: 1000,
+            gid: 1000,
+            ..Default::default()
+        };
+        let group = Caller {
+            uid: 3000,
+            gid: 2000,
+            ..Default::default()
+        };
+        let other = Caller {
+            uid: 4000,
+            gid: 4000,
+            ..Default::default()
+        };
+        let mode = 0o640; // owner rw, group r, other none
+        assert!(access_check(&owner, 1000, 2000, mode, libc::W_OK as u32).is_ok());
+        assert!(access_check(&group, 1000, 2000, mode, libc::R_OK as u32).is_ok());
+        assert_eq!(
+            access_check(&group, 1000, 2000, mode, libc::W_OK as u32),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(
+            access_check(&other, 1000, 2000, mode, libc::R_OK as u32),
+            Err(Errno::EACCES)
+        );
+    }
+
+    #[test]
+    fn symlink_roundtrips_through_readlink() {
+        let dir = std::env::temp_dir().join(format!("fuse3-symlink-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("link");
+        let target = OsStr::new("/some/arbitrary/target");
+        symlink(target, &link).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap().as_os_str(), target);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn statfs_path_reports_root_filesystem() {
+        let stat = statfs_path(Path::new("/")).unwrap();
+        assert!(stat.bsize > 0);
+        assert!(stat.blocks > 0);
     }
 }

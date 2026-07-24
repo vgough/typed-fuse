@@ -985,27 +985,66 @@ pub(crate) fn make_ops<F: NodeFs>() -> fuse_lowlevel_ops {
 // ---------------------------------------------------------------------
 
 /// A libfuse mount option, rendered to a `-o key[=value]` argument.
+///
+/// Some variants only apply on one platform (noted per-variant); on the
+/// others [`MountOption::render`] silently drops them instead of forwarding
+/// a word libfuse there would reject outright. This is the "system-specific
+/// changes handled in the wrapper" seam: callers building a portable
+/// [`MountOption`] list don't need their own `#[cfg(target_os)]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MountOption {
     ReadOnly,
     AllowOther,
+    /// Allow root to access the mount even without `allow_other`. Unlike
+    /// `uid=`/`gid=`, this is recognized by the low-level session API on
+    /// both platforms, not just `fuse_main`.
+    AllowRoot,
     AutoUnmount,
     DefaultPermissions,
+    /// Allow mounting over a non-empty directory. Meaningful on macFUSE;
+    /// libfuse3 on Linux removed this option and always allows it.
+    NonEmpty,
     FsName(String),
     Subtype(String),
+    /// macOS Finder display name for the mounted volume. Linux libfuse has
+    /// no equivalent and rejects unknown options, so this is dropped there.
+    VolName(String),
     Custom(String),
 }
 
 impl MountOption {
-    fn render(&self) -> String {
+    /// Renders this option to its libfuse `-o` word, or `None` if it does
+    /// not apply on the current platform.
+    fn render(&self) -> Option<String> {
         match self {
-            MountOption::ReadOnly => "ro".to_string(),
-            MountOption::AllowOther => "allow_other".to_string(),
-            MountOption::AutoUnmount => "auto_unmount".to_string(),
-            MountOption::DefaultPermissions => "default_permissions".to_string(),
-            MountOption::FsName(name) => format!("fsname={name}"),
-            MountOption::Subtype(name) => format!("subtype={name}"),
-            MountOption::Custom(opt) => opt.clone(),
+            MountOption::ReadOnly => Some("ro".to_string()),
+            MountOption::AllowOther => Some("allow_other".to_string()),
+            MountOption::AllowRoot => Some("allow_root".to_string()),
+            MountOption::AutoUnmount => Some("auto_unmount".to_string()),
+            MountOption::DefaultPermissions => Some("default_permissions".to_string()),
+            MountOption::NonEmpty => {
+                #[cfg(target_os = "macos")]
+                {
+                    Some("nonempty".to_string())
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    None
+                }
+            }
+            MountOption::FsName(name) => Some(format!("fsname={name}")),
+            MountOption::Subtype(name) => Some(format!("subtype={name}")),
+            MountOption::VolName(name) => {
+                #[cfg(target_os = "macos")]
+                {
+                    Some(format!("volname={name}"))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    None
+                }
+            }
+            MountOption::Custom(opt) => Some(opt.clone()),
         }
     }
 }
@@ -1019,6 +1058,8 @@ impl MountOption {
 pub enum Error {
     SessionNew,
     Mount,
+    MountPointNotFound(String),
+    MountPointNotDir(String),
     SignalHandlers,
     Loop(i32),
     InvalidMountpoint(String),
@@ -1031,6 +1072,8 @@ impl std::fmt::Display for Error {
         match self {
             Error::SessionNew => write!(f, "failed to create the FUSE session"),
             Error::Mount => write!(f, "failed to mount the FUSE session"),
+            Error::MountPointNotFound(mp) => write!(f, "mount point does not exist: {mp}"),
+            Error::MountPointNotDir(mp) => write!(f, "mount point is not a directory: {mp}"),
             Error::SignalHandlers => write!(f, "failed to install FUSE signal handlers"),
             Error::Loop(rc) => write!(f, "FUSE session loop exited with code {rc}"),
             Error::InvalidMountpoint(mp) => {
@@ -1150,14 +1193,11 @@ impl<F: NodeFs> Session<F> {
             pool.validate()?;
         }
         let mut arg_strings = vec!["fuse3".to_string()];
-        if !options.is_empty() {
-            let rendered = options
-                .iter()
-                .map(MountOption::render)
-                .collect::<Vec<_>>()
-                .join(",");
+        let rendered_options: Vec<String> =
+            options.iter().filter_map(MountOption::render).collect();
+        if !rendered_options.is_empty() {
             arg_strings.push("-o".to_string());
-            arg_strings.push(rendered);
+            arg_strings.push(rendered_options.join(","));
         }
         let arg_cstrings: Vec<CString> = arg_strings
             .into_iter()
@@ -1226,7 +1266,20 @@ impl<F: NodeFs> Session<F> {
     }
 
     /// Mounts the session at `mountpoint`.
+    ///
+    /// Validates that `mountpoint` exists and is a directory before handing
+    /// off to libfuse. On macOS, `fuse_session_mount` dispatches to the
+    /// macFUSE mount helper and returns success even when the mount point
+    /// does not exist, leaving the session loop blocked forever instead of
+    /// reporting the failure — checking here gives every caller a fast,
+    /// clear error on both platforms instead.
     pub fn mount(&mut self, mountpoint: &Path) -> Result<(), Error> {
+        if !mountpoint.exists() {
+            return Err(Error::MountPointNotFound(mountpoint.display().to_string()));
+        }
+        if !mountpoint.is_dir() {
+            return Err(Error::MountPointNotDir(mountpoint.display().to_string()));
+        }
         let c_mountpoint = CString::new(mountpoint.as_os_str().as_bytes())
             .map_err(|_| Error::InvalidMountpoint(mountpoint.display().to_string()))?;
         let rc = unsafe { fuse_session_mount(self.session, c_mountpoint.as_ptr()) };
@@ -1419,24 +1472,49 @@ mod tests {
 
     #[test]
     fn mount_option_render() {
-        assert_eq!(MountOption::ReadOnly.render(), "ro");
-        assert_eq!(MountOption::AllowOther.render(), "allow_other");
-        assert_eq!(MountOption::AutoUnmount.render(), "auto_unmount");
+        assert_eq!(MountOption::ReadOnly.render().unwrap(), "ro");
+        assert_eq!(MountOption::AllowOther.render().unwrap(), "allow_other");
+        assert_eq!(MountOption::AllowRoot.render().unwrap(), "allow_root");
+        assert_eq!(MountOption::AutoUnmount.render().unwrap(), "auto_unmount");
         assert_eq!(
-            MountOption::DefaultPermissions.render(),
+            MountOption::DefaultPermissions.render().unwrap(),
             "default_permissions"
         );
         assert_eq!(
-            MountOption::FsName("myfs".to_string()).render(),
+            MountOption::FsName("myfs".to_string()).render().unwrap(),
             "fsname=myfs"
         );
         assert_eq!(
-            MountOption::Subtype("fuse.myfs".to_string()).render(),
+            MountOption::Subtype("fuse.myfs".to_string())
+                .render()
+                .unwrap(),
             "subtype=fuse.myfs"
         );
         assert_eq!(
-            MountOption::Custom("noatime".to_string()).render(),
+            MountOption::Custom("noatime".to_string()).render().unwrap(),
             "noatime"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn mount_option_render_macos_only_options() {
+        assert_eq!(MountOption::NonEmpty.render().unwrap(), "nonempty");
+        assert_eq!(
+            MountOption::VolName("Encrypted Files".to_string())
+                .render()
+                .unwrap(),
+            "volname=Encrypted Files"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn mount_option_render_drops_macos_only_options() {
+        assert_eq!(MountOption::NonEmpty.render(), None);
+        assert_eq!(
+            MountOption::VolName("Encrypted Files".to_string()).render(),
+            None
         );
     }
 

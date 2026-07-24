@@ -46,6 +46,88 @@ pub trait PathPlusDirSink {
     fn add(&mut self, name: &OsStr, attr: NodeAttr, next_offset: u64) -> bool;
 }
 
+/// One entry captured by [`DirBuffer`].
+#[derive(Clone, Debug)]
+pub struct DirEntry {
+    pub name: OsString,
+    pub kind: FileKind,
+    pub attr: NodeAttr,
+}
+
+/// An immutable snapshot of a directory's contents, suitable for use as a
+/// [`PathFilesystem::DirHandle`].
+///
+/// Filesystems typically build one in `opendir` (so all readers of that
+/// handle see a consistent view even if the directory mutates afterward)
+/// and replay it into the kernel's sink from `readdir`/`readdirplus` via
+/// [`DirBuffer::fill`]/[`DirBuffer::fill_plus`], which own the resume-offset
+/// bookkeeping (`next_offset = index + 1`) that the FUSE protocol requires
+/// filesystems to get right themselves.
+#[derive(Clone, Debug, Default)]
+pub struct DirBuffer {
+    entries: Vec<DirEntry>,
+}
+
+impl DirBuffer {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Appends one entry.
+    pub fn push(&mut self, name: impl Into<OsString>, kind: FileKind, attr: NodeAttr) {
+        self.entries.push(DirEntry {
+            name: name.into(),
+            kind,
+            attr,
+        });
+    }
+
+    /// Appends the conventional `.` and `..` entries with the given
+    /// attributes (self and parent respectively). `read_dir`-style
+    /// directory listings omit these, so callers building a buffer from one
+    /// typically call this first.
+    pub fn push_dots(&mut self, self_attr: NodeAttr, parent_attr: NodeAttr) {
+        self.push(".", FileKind::Directory, self_attr);
+        self.push("..", FileKind::Directory, parent_attr);
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &DirEntry> {
+        self.entries.iter()
+    }
+
+    /// Replays entries from `offset` onward into `sink`, per
+    /// [`PathFilesystem::readdir`] semantics.
+    pub fn fill(&self, offset: u64, sink: &mut dyn PathDirSink) {
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        for (index, entry) in self.entries.iter().enumerate().skip(start) {
+            if !sink.add(&entry.name, entry.kind, index as u64 + 1) {
+                break;
+            }
+        }
+    }
+
+    /// Replays entries from `offset` onward into `sink`, per
+    /// [`PathFilesystem::readdirplus`] semantics.
+    pub fn fill_plus(&self, offset: u64, sink: &mut dyn PathPlusDirSink) {
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        for (index, entry) in self.entries.iter().enumerate().skip(start) {
+            if !sink.add(&entry.name, entry.attr, index as u64 + 1) {
+                break;
+            }
+        }
+    }
+}
+
 /// A synchronous path-based filesystem interface.
 ///
 /// Paths are absolute virtual paths rooted at `/`. An optional path is absent
@@ -1360,5 +1442,89 @@ mod tests {
             runtime.lookup(1, OsStr::new("enumerated"), &caller),
             Ok(LookupReply::Found(_))
         ));
+    }
+
+    #[derive(Default)]
+    struct RecordingDirSink {
+        seen: Vec<(OsString, u64)>,
+        stop_after: Option<usize>,
+    }
+
+    impl PathDirSink for RecordingDirSink {
+        fn add(&mut self, name: &OsStr, _kind: FileKind, next_offset: u64) -> bool {
+            self.seen.push((name.to_os_string(), next_offset));
+            self.stop_after != Some(self.seen.len())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingPlusDirSink {
+        seen: Vec<(OsString, u64)>,
+    }
+
+    impl PathPlusDirSink for RecordingPlusDirSink {
+        fn add(&mut self, name: &OsStr, _attr: NodeAttr, next_offset: u64) -> bool {
+            self.seen.push((name.to_os_string(), next_offset));
+            true
+        }
+    }
+
+    fn sample_dir_buffer() -> DirBuffer {
+        let mut buf = DirBuffer::new();
+        buf.push_dots(NodeAttr::default(), NodeAttr::default());
+        buf.push("a", FileKind::RegularFile, NodeAttr::default());
+        buf.push("b", FileKind::RegularFile, NodeAttr::default());
+        buf
+    }
+
+    #[test]
+    fn dir_buffer_fill_assigns_sequential_resume_offsets() {
+        let buf = sample_dir_buffer();
+        let mut sink = RecordingDirSink::default();
+        buf.fill(0, &mut sink);
+        assert_eq!(
+            sink.seen,
+            vec![
+                (OsString::from("."), 1),
+                (OsString::from(".."), 2),
+                (OsString::from("a"), 3),
+                (OsString::from("b"), 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn dir_buffer_fill_resumes_from_given_offset() {
+        let buf = sample_dir_buffer();
+        let mut sink = RecordingDirSink::default();
+        // Resume after the entry that returned next_offset = 2 (i.e. "..").
+        buf.fill(2, &mut sink);
+        assert_eq!(
+            sink.seen,
+            vec![(OsString::from("a"), 3), (OsString::from("b"), 4)]
+        );
+    }
+
+    #[test]
+    fn dir_buffer_fill_stops_when_sink_is_full() {
+        let buf = sample_dir_buffer();
+        let mut sink = RecordingDirSink {
+            stop_after: Some(2),
+            ..Default::default()
+        };
+        buf.fill(0, &mut sink);
+        assert_eq!(
+            sink.seen,
+            vec![(OsString::from("."), 1), (OsString::from(".."), 2)]
+        );
+    }
+
+    #[test]
+    fn dir_buffer_fill_plus_carries_attrs_and_offsets() {
+        let buf = sample_dir_buffer();
+        let mut sink = RecordingPlusDirSink::default();
+        buf.fill_plus(0, &mut sink);
+        assert_eq!(sink.seen.len(), 4);
+        assert_eq!(sink.seen[3], (OsString::from("b"), 4));
     }
 }

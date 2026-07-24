@@ -189,6 +189,22 @@ impl From<Vec<u8>> for XattrReply {
     }
 }
 
+impl XattrReply {
+    /// Applies the kernel's getxattr/listxattr size protocol to a fully
+    /// materialized value: `size == 0` probes the length; otherwise the
+    /// value must fit in the caller's buffer or the request fails with
+    /// `ERANGE`.
+    pub fn sized(data: Vec<u8>, size: usize) -> Result<XattrReply, Errno> {
+        if size == 0 {
+            Ok(XattrReply::Size(data.len()))
+        } else if data.len() > size {
+            Err(Errno::ERANGE)
+        } else {
+            Ok(XattrReply::Data(data))
+        }
+    }
+}
+
 /// A sink [`NodeFs::readdir`] pushes directory entries into. The runtime
 /// (via `fuse3`) implements this over libfuse's size-limited buffer
 /// protocol.

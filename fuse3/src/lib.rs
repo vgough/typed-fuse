@@ -24,6 +24,7 @@ mod ffi;
 mod session;
 
 pub mod file_lock;
+pub mod mount;
 pub mod passthrough;
 
 #[cfg(target_os = "macos")]
@@ -33,7 +34,8 @@ pub use session::{Error, MountOption, Session, SessionConfig, ThreadPoolConfig, 
 
 // The user-facing API is the node-based core.
 pub use typed_fuse_core::{
-    Caller, ConnInfo, ConnectionCapability, Cx, DirSink, Errno, FileKind, FileLock, LockKind,
-    NodeAttr, NodeFs, NodeId, NodeRef, OpenHints, Opened, PathDirSink, PathFilesystem, PathNode,
-    PathNodeFs, PathPlusDirSink, PlusDirSink, SetAttr, StatFs, TimeOrNow, XattrReply,
+    Caller, ConnInfo, ConnectionCapability, Cx, DirBuffer, DirEntry, DirSink, Errno, FileKind,
+    FileLock, LockKind, NodeAttr, NodeFs, NodeId, NodeRef, OpenHints, Opened, PathDirSink,
+    PathFilesystem, PathNode, PathNodeFs, PathPlusDirSink, PlusDirSink, SetAttr, StatFs, TimeOrNow,
+    XattrReply,
 };

@@ -24,7 +24,9 @@ pub use node_fs::{
     Caller, ConnInfo, ConnectionCapability, DirSink, FileLock, LockKind, NodeFs, NodeId, OpenHints,
     Opened, PlusDirSink, XattrReply,
 };
-pub use path_fs::{PathDirSink, PathFilesystem, PathNode, PathNodeFs, PathPlusDirSink};
+pub use path_fs::{
+    DirBuffer, DirEntry, PathDirSink, PathFilesystem, PathNode, PathNodeFs, PathPlusDirSink,
+};
 pub use runtime::{
     Cx, EntryReply, LookupReply, NodeRef, NodeTable, OpenReply, Runtime, RuntimePlusSink,
 };
