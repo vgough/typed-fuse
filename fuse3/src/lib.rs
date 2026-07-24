@@ -34,8 +34,8 @@ pub use session::{Error, MountOption, Session, SessionConfig, ThreadPoolConfig, 
 
 // The user-facing API is the node-based core.
 pub use typed_fuse_core::{
-    Caller, ConnInfo, ConnectionCapability, Cx, DirBuffer, DirEntry, DirSink, Errno, FileKind,
-    FileLock, LockKind, NodeAttr, NodeFs, NodeId, NodeRef, OpenHints, Opened, PathDirSink,
-    PathFilesystem, PathNode, PathNodeFs, PathPlusDirSink, PlusDirSink, SetAttr, StatFs, TimeOrNow,
-    XattrReply,
+    replay, Caller, ConnInfo, ConnectionCapability, Cx, DirBuffer, DirEntry, DirSink, Errno,
+    FileKind, FileLock, LockKind, NodeAttr, NodeFs, NodeId, NodeRef, OpenHints, Opened,
+    PathDirSink, PathFilesystem, PathNode, PathNodeFs, PathPlusDirSink, PlusDirSink, SetAttr,
+    StatFs, TimeOrNow, XattrReply,
 };

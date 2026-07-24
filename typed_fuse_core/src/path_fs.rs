@@ -108,22 +108,34 @@ impl DirBuffer {
     /// Replays entries from `offset` onward into `sink`, per
     /// [`PathFilesystem::readdir`] semantics.
     pub fn fill(&self, offset: u64, sink: &mut dyn PathDirSink) {
-        let start = usize::try_from(offset).unwrap_or(usize::MAX);
-        for (index, entry) in self.entries.iter().enumerate().skip(start) {
-            if !sink.add(&entry.name, entry.kind, index as u64 + 1) {
-                break;
-            }
-        }
+        replay(offset, self.entries.len(), |entry, next_offset| {
+            let entry = &self.entries[entry];
+            sink.add(&entry.name, entry.kind, next_offset)
+        });
     }
 
     /// Replays entries from `offset` onward into `sink`, per
     /// [`PathFilesystem::readdirplus`] semantics.
     pub fn fill_plus(&self, offset: u64, sink: &mut dyn PathPlusDirSink) {
-        let start = usize::try_from(offset).unwrap_or(usize::MAX);
-        for (index, entry) in self.entries.iter().enumerate().skip(start) {
-            if !sink.add(&entry.name, entry.attr, index as u64 + 1) {
-                break;
-            }
+        replay(offset, self.entries.len(), |entry, next_offset| {
+            let entry = &self.entries[entry];
+            sink.add(&entry.name, entry.attr, next_offset)
+        });
+    }
+}
+
+/// Shared readdir resume-offset bookkeeping: `offset` is the cookie the
+/// kernel handed back (0 = from the start), each entry at index `i` is
+/// emitted with `next_offset = i + 1`, and emission stops as soon as the
+/// sink reports its buffer full (`add` returns `false`). An offset beyond
+/// `len` simply emits nothing. This is the single place the FUSE readdir
+/// cookie protocol is encoded for snapshot-style listings; use it for any
+/// new `readdir` implementation backed by a materialized entry list.
+pub fn replay(offset: u64, len: usize, mut emit: impl FnMut(usize, u64) -> bool) {
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(len);
+    for index in start..len {
+        if !emit(index, index as u64 + 1) {
+            break;
         }
     }
 }
@@ -1222,6 +1234,47 @@ mod tests {
 
     use super::*;
     use crate::{LookupReply, Runtime};
+
+    #[test]
+    fn replay_emits_index_plus_one_cookies_from_offset() {
+        let mut emitted: Vec<(usize, u64)> = Vec::new();
+        replay(0, 3, |index, next_offset| {
+            emitted.push((index, next_offset));
+            true
+        });
+        assert_eq!(emitted, vec![(0, 1), (1, 2), (2, 3)]);
+
+        emitted.clear();
+        replay(2, 3, |index, next_offset| {
+            emitted.push((index, next_offset));
+            true
+        });
+        assert_eq!(emitted, vec![(2, 3)]);
+    }
+
+    #[test]
+    fn replay_stops_when_sink_is_full() {
+        let mut emitted = Vec::new();
+        replay(0, 5, |index, next_offset| {
+            emitted.push((index, next_offset));
+            index < 1 // full after the second entry
+        });
+        assert_eq!(emitted, vec![(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn replay_tolerates_out_of_range_and_huge_offsets() {
+        let mut emitted = Vec::new();
+        replay(10, 3, |index, next_offset| {
+            emitted.push((index, next_offset));
+            true
+        });
+        replay(u64::MAX, 3, |index, next_offset| {
+            emitted.push((index, next_offset));
+            true
+        });
+        assert!(emitted.is_empty());
+    }
 
     #[derive(Clone, Default)]
     struct RecordingFs {

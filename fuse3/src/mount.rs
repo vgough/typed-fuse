@@ -46,6 +46,10 @@ impl MountConfig {
     /// split from a `-o allow_other,ro` argument) to this config.
     /// Recognized words set the corresponding field; anything else is
     /// forwarded verbatim as an extra mount option.
+    ///
+    /// `ro`/`rw` are handled symmetrically: they toggle `read_only` rather
+    /// than passing through, so a later `rw` undoes an earlier `ro` the way
+    /// libfuse's own option parser would.
     pub fn parse_option_words<'a>(&mut self, words: impl IntoIterator<Item = &'a str>) {
         for word in words {
             match word {
@@ -53,6 +57,7 @@ impl MountConfig {
                 "allow_root" => self.allow_root = true,
                 "nonempty" => self.nonempty = true,
                 "ro" => self.read_only = true,
+                "rw" => self.read_only = false,
                 "default_permissions" => self.default_permissions = true,
                 other => self.extra_options.push(other.to_string()),
             }
@@ -87,6 +92,16 @@ pub fn build_mount_options(cfg: &MountConfig) -> Vec<MountOption> {
         options.push(MountOption::VolName(volname.clone()));
     }
     options.extend(cfg.extra_options.iter().cloned().map(MountOption::Custom));
+    // Every render that yields None on this platform already logs itself at
+    // debug level in MountOption::render; this counts the total so callers
+    // can spot "my option vanished" cases in one place.
+    let dropped = options
+        .iter()
+        .filter(|option| option.render().is_none())
+        .count();
+    if dropped > 0 {
+        log::debug!("{dropped} mount option(s) dropped as unsupported on this platform");
+    }
     options
 }
 
@@ -160,5 +175,15 @@ mod tests {
         assert!(config.nonempty);
         assert!(config.read_only);
         assert_eq!(config.extra_options, vec!["noatime".to_string()]);
+    }
+
+    #[test]
+    fn parse_option_words_rw_toggles_read_only_back_off() {
+        let mut config = MountConfig::new("fs");
+        config.parse_option_words(["ro", "rw"]);
+        assert!(!config.read_only);
+        config.parse_option_words(["ro"]);
+        assert!(config.read_only);
+        assert!(config.extra_options.is_empty());
     }
 }

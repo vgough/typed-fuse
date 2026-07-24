@@ -306,9 +306,9 @@ pub fn is_apple_xattr(name: &str) -> bool {
 /// POSIX `access(2)` permission check: selects the owner/group/other mode
 /// triplet based on the caller's uid/gid versus the file's, and verifies the
 /// requested `mask` (`R_OK`/`W_OK`/`X_OK` bits) against it. Root always
-/// passes; `mask == 0` (`F_OK`) only checks existence, which callers signal
-/// by not calling this at all — kept here as an explicit early-out since the
-/// mask still arrives as a bitmask that may legitimately be zero.
+/// passes. A `mask` of 0 (`F_OK`, existence probe) trivially passes: callers
+/// are expected to have already checked existence while resolving `file_*`
+/// metadata, so reaching here at all means the file exists.
 pub fn access_check(
     caller: &Caller,
     file_uid: u32,
@@ -316,10 +316,11 @@ pub fn access_check(
     mode: u32,
     mask: u32,
 ) -> Result<(), Errno> {
-    if mask == 0 {
-        return Ok(());
-    }
-    if caller.uid == 0 {
+    debug_assert!(
+        mask & !0o7 == 0,
+        "access_check mask contains non-RWX bits: {mask:#o}"
+    );
+    if mask & 0o7 == 0 || caller.uid == 0 {
         return Ok(());
     }
     let effective = if caller.uid == file_uid {

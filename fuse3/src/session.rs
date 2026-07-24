@@ -1019,7 +1019,7 @@ impl MountOption {
     /// `cfg!` rather than `#[cfg]` keeps both branches compiled on every
     /// platform, so the inapplicable arm can't bit-rot and the bound `name`
     /// is always used.
-    fn render(&self) -> Option<String> {
+    pub(crate) fn render(&self) -> Option<String> {
         let dropped = |word: &str| {
             log::debug!("dropping mount option {word:?}: not supported on this platform");
             None
