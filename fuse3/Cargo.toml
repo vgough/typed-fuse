@@ -7,6 +7,7 @@ edition = "2021"
 libfuse-sys = { path = "..", default-features = false, features = ["fuse_lowlevel", "fuse_312"] }
 typed_fuse_core = { path = "../typed_fuse_core" }
 libc = "0.2"
+log = "0.4"
 
 [build-dependencies]
 pkg-config = "0.3"

@@ -138,7 +138,7 @@ pub(crate) fn conn_apply(conn: *mut fuse_conn_info, info: &ConnInfo) {
     }
 }
 
-// --- DirBuffer: the DirSink implementation ---
+// --- RawDirentBuf: the DirSink implementation ---
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Format {
@@ -154,7 +154,7 @@ enum Format {
 /// A `readdir` reply builder implementing libfuse's size-limited buffer
 /// protocol and [`DirSink`]. The runtime pushes entries in via
 /// [`DirSink::add`].
-pub(crate) struct DirBuffer {
+pub(crate) struct RawDirentBuf {
     req: fuse_req_t,
     capacity: usize,
     buf: Vec<u8>,
@@ -162,9 +162,9 @@ pub(crate) struct DirBuffer {
     ttl: std::time::Duration,
 }
 
-impl DirBuffer {
+impl RawDirentBuf {
     pub(crate) fn new(req: fuse_req_t, size: usize) -> Self {
-        DirBuffer {
+        RawDirentBuf {
             req,
             capacity: size,
             buf: Vec::with_capacity(size),
@@ -173,9 +173,9 @@ impl DirBuffer {
         }
     }
 
-    /// Like [`DirBuffer::new`], but emits attribute-carrying READDIRPLUS entries.
+    /// Like [`RawDirentBuf::new`], but emits attribute-carrying READDIRPLUS entries.
     pub(crate) fn new_plus(req: fuse_req_t, size: usize, ttl: std::time::Duration) -> Self {
-        DirBuffer {
+        RawDirentBuf {
             req,
             capacity: size,
             buf: Vec::with_capacity(size),
@@ -189,7 +189,7 @@ impl DirBuffer {
     }
 }
 
-impl DirSink for DirBuffer {
+impl DirSink for RawDirentBuf {
     fn add(&mut self, name: &OsStr, id: NodeId, kind: FileKind, next_offset: u64) -> bool {
         // Real filenames never contain interior NULs; silently skip if one
         // somehow does rather than aborting the whole listing.
@@ -226,7 +226,7 @@ impl DirSink for DirBuffer {
     }
 }
 
-impl RuntimePlusSink for DirBuffer {
+impl RuntimePlusSink for RawDirentBuf {
     fn add(&mut self, name: &OsStr, entry: EntryReply, next_offset: u64) -> bool {
         let cname = match std::ffi::CString::new(name.as_bytes()) {
             Ok(c) => c,

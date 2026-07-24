@@ -80,7 +80,7 @@ use typed_fuse_core::{Caller, Errno, FileLock, LookupReply, NodeFs, Runtime, Xat
 use crate::conv::{
     attr_to_stat, entry_to_entry_param, negative_entry_param, setattr_from_raw, statfs_to_raw,
 };
-use crate::ffi::{apply_open, conn_apply, conn_read, fi_fh, fi_fh_opt, fi_flags, DirBuffer};
+use crate::ffi::{apply_open, conn_apply, conn_read, fi_fh, fi_fh_opt, fi_flags, RawDirentBuf};
 use crate::file_lock;
 use typed_fuse_core::{EntryReply, NodeAttr};
 
@@ -576,7 +576,7 @@ unsafe extern "C" fn readdir_shim<F: NodeFs>(
         return;
     }
     let fh = fi_fh(fi);
-    let mut buf = DirBuffer::new(req, size);
+    let mut buf = RawDirentBuf::new(req, size);
     match call_fs::<F, _>(req, |rt, c| rt.readdir(ino, fh, off as u64, &mut buf, c)) {
         Ok(()) => {
             reply_dir_buf(req, buf.as_slice());
@@ -597,7 +597,7 @@ unsafe extern "C" fn readdirplus_shim<F: NodeFs>(
         return;
     }
     let fh = fi_fh(fi);
-    let mut buf = DirBuffer::new_plus(req, size, holder_of::<F>(req).ttl());
+    let mut buf = RawDirentBuf::new_plus(req, size, holder_of::<F>(req).ttl());
     match call_fs::<F, _>(req, |rt, c| {
         rt.readdirplus(ino, fh, off as u64, &mut buf, c)
     }) {
@@ -1014,8 +1014,16 @@ pub enum MountOption {
 
 impl MountOption {
     /// Renders this option to its libfuse `-o` word, or `None` if it does
-    /// not apply on the current platform.
+    /// not apply on the current platform (logged at debug level).
+    ///
+    /// `cfg!` rather than `#[cfg]` keeps both branches compiled on every
+    /// platform, so the inapplicable arm can't bit-rot and the bound `name`
+    /// is always used.
     fn render(&self) -> Option<String> {
+        let dropped = |word: &str| {
+            log::debug!("dropping mount option {word:?}: not supported on this platform");
+            None
+        };
         match self {
             MountOption::ReadOnly => Some("ro".to_string()),
             MountOption::AllowOther => Some("allow_other".to_string()),
@@ -1023,25 +1031,19 @@ impl MountOption {
             MountOption::AutoUnmount => Some("auto_unmount".to_string()),
             MountOption::DefaultPermissions => Some("default_permissions".to_string()),
             MountOption::NonEmpty => {
-                #[cfg(target_os = "macos")]
-                {
+                if cfg!(target_os = "macos") {
                     Some("nonempty".to_string())
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    None
+                } else {
+                    dropped("nonempty")
                 }
             }
             MountOption::FsName(name) => Some(format!("fsname={name}")),
             MountOption::Subtype(name) => Some(format!("subtype={name}")),
             MountOption::VolName(name) => {
-                #[cfg(target_os = "macos")]
-                {
+                if cfg!(target_os = "macos") {
                     Some(format!("volname={name}"))
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    None
+                } else {
+                    dropped(&format!("volname={name}"))
                 }
             }
             MountOption::Custom(opt) => Some(opt.clone()),
