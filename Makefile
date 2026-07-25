@@ -7,11 +7,11 @@ hello_ll:
 	cargo build -p libfuse-sys --example hello_ll_raw --features fuse_35
 
 memory_fs:
-	cargo build -p fuse3 --example memory_fs
+	cargo build -p typed-fuse --example memory_fs
 
 run_memory_fs:
 	mkdir -p /tmp/memfs
-	cargo run -p fuse3 --example memory_fs -- /tmp/memfs
+	cargo run -p typed-fuse --example memory_fs -- /tmp/memfs
 
 BENCH_BASELINE ?= .benchmarks/filesystem-baseline.json
 BENCH_ITEMS ?= 1000
@@ -23,22 +23,22 @@ MPIRUN_BIN ?= mpirun
 BENCH_MOUNT_TIMEOUT_SECS ?= 30
 
 benchmark: memory_fs_release
-	test -f 'fuse3/$(BENCH_BASELINE)' || (echo "Benchmark baseline fuse3/$(BENCH_BASELINE) is missing; run 'make benchmark-save-baseline' first" >&2; exit 1)
+	test -f 'typed-fuse/$(BENCH_BASELINE)' || (echo "Benchmark baseline typed-fuse/$(BENCH_BASELINE) is missing; run 'make benchmark-save-baseline' first" >&2; exit 1)
 	BENCH_BASELINE='$(BENCH_BASELINE)' BENCH_ITEMS='$(BENCH_ITEMS)' \
 		BENCH_ITERATIONS='$(BENCH_ITERATIONS)' BENCH_PROCS='$(BENCH_PROCS)' \
 		BENCH_BYTES='$(BENCH_BYTES)' MDTEST_BIN='$(MDTEST_BIN)' \
 		MPIRUN_BIN='$(MPIRUN_BIN)' BENCH_MOUNT_TIMEOUT_SECS='$(BENCH_MOUNT_TIMEOUT_SECS)' \
-		cargo bench -p fuse3 --bench filesystem
+		cargo bench -p typed-fuse --bench filesystem
 
 benchmark-save-baseline: memory_fs_release
 	BENCH_SAVE_BASELINE=1 BENCH_BASELINE='$(BENCH_BASELINE)' BENCH_ITEMS='$(BENCH_ITEMS)' \
 		BENCH_ITERATIONS='$(BENCH_ITERATIONS)' BENCH_PROCS='$(BENCH_PROCS)' \
 		BENCH_BYTES='$(BENCH_BYTES)' MDTEST_BIN='$(MDTEST_BIN)' \
 		MPIRUN_BIN='$(MPIRUN_BIN)' BENCH_MOUNT_TIMEOUT_SECS='$(BENCH_MOUNT_TIMEOUT_SECS)' \
-		cargo bench -p fuse3 --bench filesystem
+		cargo bench -p typed-fuse --bench filesystem
 
 memory_fs_release:
-	cargo build --release -p fuse3 --example memory_fs
+	cargo build --release -p typed-fuse --example memory_fs
 
 clean:
 	cargo clean

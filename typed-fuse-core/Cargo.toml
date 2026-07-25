@@ -1,5 +1,5 @@
 [package]
-name = "typed_fuse_core"
+name = "typed-fuse-core"
 version = "0.1.0"
 edition = "2021"
 description = "Backend-neutral, node-tracking core for building FUSE filesystems"

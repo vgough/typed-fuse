@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-07-21T21:44:26.109679+00:00",
+  "git_revision": "c11715460ffc10b797cebb7b29d19685b39dcb8d",
+  "mdtest_version": "4.1.0+dev",
+  "host": {
+    "os": "Darwin",
+    "os_version": "26.5.2",
+    "architecture": "aarch64",
+    "cpu": "Apple M4 Pro"
+  },
+  "workload": {
+    "ranks": 1,
+    "items_per_rank": 1000,
+    "iterations": 5,
+    "bytes_per_file": 4096
+  },
+  "metrics": {
+    "Directory creation": 3287.631,
+    "Directory removal": 4014.188,
+    "Directory rename": 1993.755,
+    "Directory stat": 24119.911,
+    "File creation": 2695.313,
+    "File read": 15474.598,
+    "File removal": 4466.302,
+    "File stat": 38708.686,
+    "Tree creation": 3395.091,
+    "Tree removal": 3549.676
+  }
+}

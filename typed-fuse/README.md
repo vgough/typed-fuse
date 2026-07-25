@@ -1,11 +1,11 @@
-# fuse3
+# typed-fuse
 
 **A safe, Rust-friendly low-level FUSE API, built on top of [`libfuse-sys`](..)**
 
 `libfuse-sys` exposes only raw bindgen bindings to libfuse: writing a filesystem against
 it means writing `unsafe` callbacks, using C types (`*const c_char`, `stat`,
 `mem::zeroed()`), and sprinkling `#[cfg(target_os = "macos")]` around to handle libfuse's
-Darwin-specific quirks. `fuse3` centralizes all of that here so filesystem authors write
+Darwin-specific quirks. `typed-fuse` centralizes all of that here so filesystem authors write
 none of it.
 
 ## What you get
@@ -29,7 +29,7 @@ none of it.
 ```rust
 use std::borrow::Cow;
 use std::path::Path;
-use fuse3::{Caller, Errno, FileKind, NodeAttr, NodeFs, Opened, Session};
+use typed_fuse::{Caller, Errno, FileKind, NodeAttr, NodeFs, Opened, Session};
 
 const HELLO_CONTENT: &[u8] = b"Hello World!\n";
 
@@ -82,7 +82,7 @@ directory root plus the relevant lookup and directory-reading operations; see
 retirement and `clone_fd` disabled. Libfuse limits `max_threads` to 100,000:
 
 ```rust
-use fuse3::{SessionConfig, ThreadingMode};
+use typed_fuse::{SessionConfig, ThreadingMode};
 let config = SessionConfig { threading: ThreadingMode::SingleThreaded };
 // Session::new_with_config(fs, &options, config)?;
 ```
@@ -99,7 +99,7 @@ read-only filesystem exposing a single file, `hello`, containing `Hello World!\n
 
 ```sh
 mkdir /tmp/hello_mnt
-cargo run -p fuse3 --example hello_ll -- /tmp/hello_mnt
+cargo run -p typed-fuse --example hello_ll -- /tmp/hello_mnt
 ```
 
 In another terminal:

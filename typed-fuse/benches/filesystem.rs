@@ -108,7 +108,7 @@ fn run_filesystem_benchmark(
         .join(executable_name("memory_fs"));
     if !memory_fs.is_file() {
         bail!(
-            "release example {} is missing; run `cargo build --release -p fuse3 --example memory_fs` first",
+            "release example {} is missing; run `cargo build --release -p typed-fuse --example memory_fs` first",
             memory_fs.display()
         );
     }

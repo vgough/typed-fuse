@@ -1,41 +1,7 @@
 [workspace]
-members = ["fuse3", "typed_fuse_core"]
-
-[package]
-name = "libfuse-sys"
-version = "0.4.0"
-description = "Raw bindings to libfuse"
-repository = "https://github.com/richard-w/libfuse-sys"
-authors = ["Richard Wiedenhöft <richard@wiedenhoeft.xyz>"]
-license = "MIT AND LGPL-2.0-or-later"
-categories = ["external-ffi-bindings"]
-keywords = ["fuse", "bindings", "filesystem", "fs"]
-readme = "README.md"
-edition = "2018"
-build = "build.rs"
-
-[dependencies]
-libc = "0.2"
-
-[build-dependencies]
-bindgen = "0.72.1"
-pkg-config = "0.3"
-
-[[example]]
-name = "hello_ll_raw"
-required-features = ["fuse_lowlevel"]
-
-[features]
-default = ["fuse_highlevel", "fuse_lowlevel"]
-
-# Generate highlevel fuse bindings
-fuse_highlevel = []
-# Generate lowlevel fuse bindings
-fuse_lowlevel = []
-# Generate lowlevel cuse bindings
-cuse_lowlevel = []
-
-# API versions
-fuse_31 = []
-fuse_35 = []
-fuse_312 = []
+members = [
+    "typed-fuse",
+    "libfuse-sys",
+    "typed-fuse-core"
+]
+resolver = "2"

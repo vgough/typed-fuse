@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::RwLock;
 use std::time::SystemTime;
 
-use fuse3::{Caller, Cx, Errno, FileKind, NodeAttr, NodeFs, NodeId, Opened, Session};
+use typed_fuse::{Caller, Cx, Errno, FileKind, NodeAttr, NodeFs, NodeId, Opened, Session};
 
 const HELLO_CONTENT: &[u8] = b"Hello World!\n";
 
@@ -132,7 +132,7 @@ impl NodeFs for HelloFs {
         parent: NodeId,
         _dh: &(),
         offset: u64,
-        sink: &mut dyn fuse3::DirSink,
+        sink: &mut dyn typed_fuse::DirSink,
         _c: &Caller,
     ) -> Result<(), Errno> {
         let Node::Dir { entries } = node else {

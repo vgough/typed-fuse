@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
 
-use fuse3::{
+use typed_fuse::{
     Caller, Cx, DirSink, Errno, FileKind, NodeAttr, NodeFs, NodeId, Opened, Session, SetAttr,
     TimeOrNow,
 };
@@ -699,17 +699,17 @@ impl NodeFs for MemoryFs {
         name: &OsStr,
         size: usize,
         _c: &Caller,
-    ) -> Result<fuse3::XattrReply, Errno> {
+    ) -> Result<typed_fuse::XattrReply, Errno> {
         let node = node.read();
         let value = node.xattrs.get(name).ok_or(Errno::ENODATA)?;
         if size == 0 {
-            Ok(fuse3::XattrReply::Size(value.len()))
+            Ok(typed_fuse::XattrReply::Size(value.len()))
         } else {
-            Ok(fuse3::XattrReply::Data(value.clone()))
+            Ok(typed_fuse::XattrReply::Data(value.clone()))
         }
     }
 
-    fn listxattr(&self, node: &Node, size: usize, _c: &Caller) -> Result<fuse3::XattrReply, Errno> {
+    fn listxattr(&self, node: &Node, size: usize, _c: &Caller) -> Result<typed_fuse::XattrReply, Errno> {
         let node = node.read();
         let mut names = Vec::new();
         for name in node.xattrs.keys() {
@@ -717,9 +717,9 @@ impl NodeFs for MemoryFs {
             names.push(0);
         }
         if size == 0 {
-            Ok(fuse3::XattrReply::Size(names.len()))
+            Ok(typed_fuse::XattrReply::Size(names.len()))
         } else {
-            Ok(fuse3::XattrReply::Data(names))
+            Ok(typed_fuse::XattrReply::Data(names))
         }
     }
 

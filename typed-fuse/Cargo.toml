@@ -1,11 +1,11 @@
 [package]
-name = "fuse3"
+name = "typed-fuse"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-libfuse-sys = { path = "..", default-features = false, features = ["fuse_lowlevel", "fuse_312"] }
-typed_fuse_core = { path = "../typed_fuse_core" }
+libfuse-sys = { path = "../libfuse-sys", default-features = false, features = ["fuse_lowlevel", "fuse_312"] }
+typed-fuse-core = { path = "../typed-fuse-core" }
 libc = "0.2"
 log = "0.4"
 
