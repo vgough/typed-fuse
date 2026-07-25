@@ -2,8 +2,8 @@
 name = "libfuse-sys"
 version = "0.4.0"
 description = "Raw bindings to libfuse"
-repository = "https://github.com/richard-w/libfuse-sys"
-authors = ["Richard Wiedenhöft <richard@wiedenhoeft.xyz>"]
+repository = "https://github.com/vgough/libfuse-sys"
+authors = ["Richard Wiedenhöft <richard@wiedenhoeft.xyz>", "Valient Gough <vgough@arg0.net>"]
 license = "MIT AND LGPL-2.0-or-later"
 categories = ["external-ffi-bindings"]
 keywords = ["fuse", "bindings", "filesystem", "fs"]
