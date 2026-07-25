@@ -26,7 +26,7 @@ use std::os::raw::{c_char, c_int};
 type Attr = stat;
 type EntryParam = fuse_entry_param;
 
-extern "C" {
+unsafe extern "C" {
     #[link_name = "fuse_reply_entry"]
     pub(crate) fn fuse_reply_entry_vanilla(req: fuse_req_t, e: *const EntryParam) -> c_int;
 

@@ -42,7 +42,7 @@ mod imp {
     // vanilla structs, so bind directly to the plain symbol names instead of going
     // through libfuse_sys's aliased declarations.
     #[cfg(target_os = "macos")]
-    extern "C" {
+    unsafe extern "C" {
         #[link_name = "fuse_reply_entry"]
         fn fuse_reply_entry_vanilla(req: fuse_req_t, e: *const EntryParam) -> c_int;
         #[link_name = "fuse_reply_attr"]

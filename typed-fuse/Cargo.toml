@@ -1,7 +1,14 @@
 [package]
 name = "typed-fuse"
 version = "0.1.0"
-edition = "2021"
+description = "High-level, safe Rust wrapper for building FUSE 3 filesystems"
+repository = "https://github.com/vgough/typed-fuse"
+authors = ["Valient Gough <vgough@arg0.net>"]
+license = "MIT"
+readme = "README.md"
+keywords = ["fuse", "filesystem", "fs", "bindings"]
+categories = ["filesystem"]
+edition = "2024"
 
 [dependencies]
 libfuse-sys = { path = "../libfuse-sys", default-features = false, features = ["fuse_lowlevel", "fuse_312"] }

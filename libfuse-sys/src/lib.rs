@@ -32,7 +32,7 @@ pub mod fuse {
         user_data: *mut c_void,
     ) -> c_int {
         #[cfg(target_os = "macos")]
-        {
+        unsafe {
             let mut version = libfuse_version {
                 major: FUSE_MAJOR_VERSION as _,
                 minor: FUSE_MINOR_VERSION as _,
@@ -50,7 +50,7 @@ pub mod fuse {
             )
         }
         #[cfg(not(target_os = "macos"))]
-        {
+        unsafe {
             fuse_main_real(argc, argv, op, std::mem::size_of_val(&*op), user_data)
         }
     }

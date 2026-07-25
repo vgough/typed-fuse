@@ -2,13 +2,13 @@
 name = "libfuse-sys"
 version = "0.4.0"
 description = "Raw bindings to libfuse"
-repository = "https://github.com/vgough/libfuse-sys"
+repository = "https://github.com/vgough/typed-fuse"
 authors = ["Richard Wiedenhöft <richard@wiedenhoeft.xyz>", "Valient Gough <vgough@arg0.net>"]
 license = "MIT AND LGPL-2.0-or-later"
 categories = ["external-ffi-bindings"]
 keywords = ["fuse", "bindings", "filesystem", "fs"]
 readme = "README.md"
-edition = "2018"
+edition = "2024"
 build = "build.rs"
 
 [dependencies]
