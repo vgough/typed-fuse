@@ -88,7 +88,8 @@ impl NodeData {
         match &self.content {
             Content::File(v) => v.len() as u64,
             Content::Symlink(s) => s.as_os_str().as_bytes().len() as u64,
-            _ => 0,
+            Content::Dir(entries) => entries.len() as u64,
+            Content::Special => 0,
         }
     }
 
