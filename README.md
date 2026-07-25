@@ -11,6 +11,19 @@ This repository is a workspace containing the following crates:
 
 This project started as a fork of the excellent [libfuse-sys](https://github.com/richard-w/libfuse-sys) crate by Richard Wiedenhöft, before expanding to include higher-level, safe abstractions for building filesystems. The raw FFI bindings remain in the `libfuse-sys` sub-crate.
 
+### Changes to `libfuse-sys` vs Upstream
+
+Compared to the upstream [`richard-w/libfuse-sys`](https://github.com/richard-w/libfuse-sys) repository, key changes in this fork's `libfuse-sys` sub-crate include:
+
+* **FUSE 3.x Exclusivity**: Dropped support for legacy FUSE 2.x API feature flags (`fuse_11` through `fuse_30`). FUSE 3 (`fuse3` pkg-config module) is now required, and the default API version was raised from 30 to 35.
+* **FUSE 3.12+ Support**: Added the `fuse_312` feature flag (requiring `libfuse >= 3.12.0`).
+* **macOS / macFUSE Compatibility**:
+  * Added support for macFUSE ABI extensions (`fuse_main_real_versioned`).
+  * Provided platform-portable wrappers (`session_loop_mt_312`, `parse_cmdline_312`, `loop_cfg_*`) to reconcile symbol naming differences between macFUSE on macOS (which appends `_312` suffixes) and Linux libfuse (which uses symbol versioning).
+* **Robust Build & Header Resolution**: Added compiler resource path probing (locating `stdarg.h` via `CLANG_PATH`, `CC`, `gcc`, or `cc`) to resolve `bindgen` errors on systems where `libclang` fails to locate compiler-internal include paths.
+* **Updated Tooling & Bindgen**: Upgraded `bindgen` to 0.72 with refined symbol allowlist filtering and clippy lint suppressions for generated bindings.
+* **Workspace Restructuring**: Reorganized into a sub-crate within the `typed-fuse` Cargo workspace and added raw FFI examples (`hello_ll_raw.rs`).
+
 ---
 
 ## The `typed-fuse` crate: a safe wrapper
