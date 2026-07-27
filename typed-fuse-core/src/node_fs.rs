@@ -276,6 +276,10 @@ pub trait NodeFs: Sized + Send + Sync {
     /// [`NodeFs::getlk`]/[`NodeFs::setlk`]. Left disabled by default since
     /// most filesystems delegate POSIX locking to the kernel.
     const SUPPORTS_POSIX_LOCKS: bool = false;
+    /// Set to `true` to register the `flock` callback and enable
+    /// [`NodeFs::flock`]. Left disabled by default since most filesystems
+    /// delegate BSD locking to the kernel.
+    const SUPPORTS_FLOCK: bool = false;
     /// Set to `true` to register the `readdirplus` callback and enable
     /// [`NodeFs::readdirplus`], letting the kernel populate its attribute
     /// cache from directory listings instead of a follow-up `lookup` per
@@ -691,6 +695,19 @@ pub trait NodeFs: Sized + Send + Sync {
         owner: u64,
         lock: FileLock,
         sleep: bool,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// Acquires, modifies, or releases a BSD lock on `handle`. `operation` is
+    /// the platform's `LOCK_SH`, `LOCK_EX`, or `LOCK_UN`, optionally combined
+    /// with `LOCK_NB`. Only called when [`NodeFs::SUPPORTS_FLOCK`] is `true`.
+    fn flock(
+        &self,
+        node: &Self::Node,
+        handle: &Self::Handle,
+        operation: i32,
         caller: &Caller,
     ) -> Result<(), Errno> {
         Err(Errno::ENOSYS)

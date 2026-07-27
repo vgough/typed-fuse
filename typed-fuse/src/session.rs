@@ -58,8 +58,8 @@ use libfuse_sys::fuse_lowlevel::{
 use libfuse_sys::fuse_lowlevel::fuse_session_new;
 #[cfg(target_os = "macos")]
 use libfuse_sys::fuse_lowlevel::{
-    fuse_session_new_versioned, libfuse_version, FUSE_HOTFIX_VERSION, FUSE_MAJOR_VERSION,
-    FUSE_MINOR_VERSION,
+    FUSE_HOTFIX_VERSION, FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION, fuse_session_new_versioned,
+    libfuse_version,
 };
 
 #[cfg(target_os = "macos")]
@@ -80,7 +80,7 @@ use typed_fuse_core::{Caller, Errno, FileLock, LookupReply, NodeFs, Runtime, Xat
 use crate::conv::{
     attr_to_stat, entry_to_entry_param, negative_entry_param, setattr_from_raw, statfs_to_raw,
 };
-use crate::ffi::{apply_open, conn_apply, conn_read, fi_fh, fi_fh_opt, fi_flags, RawDirentBuf};
+use crate::ffi::{RawDirentBuf, apply_open, conn_apply, conn_read, fi_fh, fi_fh_opt, fi_flags};
 use crate::file_lock;
 use typed_fuse_core::{EntryReply, NodeAttr};
 
@@ -886,6 +886,19 @@ unsafe extern "C" fn setlk_shim<F: NodeFs>(
     }
 }
 
+unsafe extern "C" fn flock_shim<F: NodeFs>(
+    req: fuse_req_t,
+    ino: fuse_ino_t,
+    fi: *mut fuse_file_info,
+    operation: c_int,
+) {
+    let fh = fi_fh(fi);
+    match call_fs::<F, _>(req, |rt, c| rt.flock(ino, fh, operation, c)) {
+        Ok(()) => reply_ok(req),
+        Err(e) => reply_err(req, e),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C" fn copy_file_range_shim<F: NodeFs>(
     req: fuse_req_t,
@@ -921,8 +934,8 @@ unsafe extern "C" fn copy_file_range_shim<F: NodeFs>(
 // ---------------------------------------------------------------------
 
 /// Builds a `fuse_lowlevel_ops` table wiring every operation the runtime
-/// covers to its trampoline. Uncovered ops (`getlk`/`setlk`/`flock`,
-/// `ioctl`, `poll`, `bmap`, `write_buf`, `retrieve_reply`, `statx`,
+/// covers to its trampoline. Uncovered ops (`ioctl`, `poll`, `bmap`,
+/// `write_buf`, `retrieve_reply`, `statx`,
 /// `tmpfile`, macOS-only extensions, ...) are left `None`.
 pub(crate) fn make_ops<F: NodeFs>() -> fuse_lowlevel_ops {
     fuse_lowlevel_ops {
@@ -973,6 +986,11 @@ pub(crate) fn make_ops<F: NodeFs>() -> fuse_lowlevel_ops {
         },
         setlk: if F::SUPPORTS_POSIX_LOCKS {
             Some(setlk_shim::<F>)
+        } else {
+            None
+        },
+        flock: if F::SUPPORTS_FLOCK {
+            Some(flock_shim::<F>)
         } else {
             None
         },
@@ -1437,6 +1455,7 @@ mod tests {
         type Handle = ();
         type DirHandle = ();
         const SUPPORTS_POSIX_LOCKS: bool = true;
+        const SUPPORTS_FLOCK: bool = true;
         const SUPPORTS_READDIRPLUS: bool = true;
         fn root(&mut self) {}
         fn getattr(&self, _: &(), _: Option<&()>, _: &Caller) -> Result<NodeAttr, Errno> {
@@ -1450,6 +1469,7 @@ mod tests {
         assert!(ops.readdirplus.is_some());
         assert!(ops.getlk.is_some());
         assert!(ops.setlk.is_some());
+        assert!(ops.flock.is_some());
     }
 
     #[test]

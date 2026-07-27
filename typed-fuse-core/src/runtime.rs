@@ -639,6 +639,12 @@ impl<F: NodeFs> Runtime<F> {
         self.fs.setlk(&n, &h, owner, lock, sleep, caller)
     }
 
+    pub fn flock(&self, ino: u64, fh: u64, operation: i32, caller: &Caller) -> Result<(), Errno> {
+        let n = self.node(ino)?;
+        let h = self.file(ino, fh)?;
+        self.fs.flock(&n, &h, operation, caller)
+    }
+
     pub fn release(&self, ino: u64, fh: u64, caller: &Caller) -> Result<(), Errno> {
         let mut handles = lock(&self.handles);
         if handles.files.get(&fh).is_none_or(|r| r.node.ino() != ino) {

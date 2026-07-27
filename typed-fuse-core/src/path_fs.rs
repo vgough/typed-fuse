@@ -157,6 +157,9 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// Left disabled by default since most filesystems delegate POSIX
     /// locking to the kernel.
     const SUPPORTS_POSIX_LOCKS: bool = false;
+    /// Set to `true` to enable [`PathFilesystem::flock`]. Left disabled by
+    /// default since most filesystems delegate BSD locking to the kernel.
+    const SUPPORTS_FLOCK: bool = false;
     /// Set to `true` to enable [`PathFilesystem::readdirplus`], letting the
     /// kernel populate its attribute cache from directory listings instead
     /// of a follow-up `lookup` per entry.
@@ -515,6 +518,20 @@ pub trait PathFilesystem: Send + Sync + Sized {
     ) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
     }
+
+    /// Acquires, modifies, or releases a BSD lock on `handle`. `operation` is
+    /// the platform's `LOCK_SH`, `LOCK_EX`, or `LOCK_UN`, optionally combined
+    /// with `LOCK_NB`. Only called when
+    /// [`PathFilesystem::SUPPORTS_FLOCK`] is `true`.
+    fn flock(
+        &self,
+        path: Option<&Path>,
+        handle: &Self::Handle,
+        operation: i32,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
 }
 
 /// The [`NodeFs::Node`] payload used by [`PathNodeFs`]. Opaque; filesystems
@@ -663,6 +680,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     type DirHandle = P::DirHandle;
 
     const SUPPORTS_POSIX_LOCKS: bool = P::SUPPORTS_POSIX_LOCKS;
+    const SUPPORTS_FLOCK: bool = P::SUPPORTS_FLOCK;
     const SUPPORTS_READDIRPLUS: bool = P::SUPPORTS_READDIRPLUS;
 
     fn root(&mut self) -> Self::Node {
@@ -1126,6 +1144,17 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         let p = self.node_path(node);
         self.inner
             .setlk(p.as_deref(), handle, owner, lock, sleep, caller)
+    }
+    fn flock(
+        &self,
+        node: &PathNode,
+        handle: &P::Handle,
+        operation: i32,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
+        let _g = read_lock(&self.operations);
+        let p = self.node_path(node);
+        self.inner.flock(p.as_deref(), handle, operation, caller)
     }
 }
 
