@@ -1,6 +1,6 @@
 [package]
 name = "typed-fuse-core"
-version = "0.1.0"
+version = "0.5.0"
 description = "Backend-neutral, node-tracking core for building FUSE filesystems"
 repository = "https://github.com/vgough/typed-fuse"
 authors = ["Valient Gough <vgough@arg0.net>"]
