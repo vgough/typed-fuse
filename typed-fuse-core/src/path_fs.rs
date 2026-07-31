@@ -170,6 +170,14 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// Called on filesystem exit.
     fn destroy(&self) {}
 
+    /// Called when the kernel's lookup count for a node reaches zero.
+    ///
+    /// `path` is the adapter's current canonical path for the node, or
+    /// `None` if its last known name has already been removed. This is a
+    /// notification only: it may be delivered while the node still has links
+    /// or open handles, and it cannot report an error.
+    fn forget(&self, path: Option<&Path>) {}
+
     /// Looks up `name` in directory `parent`. Return `Ok(Some(attr))` for a
     /// hit, `Ok(None)` to populate the kernel's negative-lookup cache, or
     /// `Err` for a hard failure.
@@ -691,6 +699,11 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     }
     fn destroy(&self) {
         self.inner.destroy()
+    }
+    fn forget(&self, node: &PathNode) {
+        let _guard = read_lock(&self.operations);
+        let path = self.node_path(node);
+        self.inner.forget(path.as_deref());
     }
 
     fn getattr(
@@ -1308,6 +1321,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingFs {
         getattr_paths: Arc<Mutex<Vec<Option<PathBuf>>>>,
+        forgotten_paths: Arc<Mutex<Vec<Option<PathBuf>>>>,
     }
 
     impl PathFilesystem for RecordingFs {
@@ -1331,6 +1345,10 @@ mod tests {
         ) -> Result<NodeAttr, Errno> {
             mutex(&self.getattr_paths).push(path.map(Path::to_path_buf));
             Ok(NodeAttr::default())
+        }
+
+        fn forget(&self, path: Option<&Path>) {
+            mutex(&self.forgotten_paths).push(path.map(Path::to_path_buf));
         }
 
         fn rename(
@@ -1442,6 +1460,47 @@ mod tests {
             mutex(&paths).last().unwrap().as_deref(),
             Some(Path::new("/new/child"))
         );
+    }
+
+    #[test]
+    fn forget_reports_the_current_path_for_each_zero_lookup_transition() {
+        let recording = RecordingFs::default();
+        let forgotten = Arc::clone(&recording.forgotten_paths);
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let node = found(runtime.lookup(1, OsStr::new("old"), &caller).unwrap());
+
+        runtime
+            .rename(1, OsStr::new("old"), 1, OsStr::new("new"), 0, &caller)
+            .unwrap();
+        runtime.forget(node, 1);
+        runtime.forget(node, 1);
+
+        assert_eq!(mutex(&forgotten).as_slice(), [Some(PathBuf::from("/new"))]);
+
+        assert_eq!(
+            found(runtime.lookup(1, OsStr::new("new"), &caller).unwrap()),
+            node
+        );
+        runtime.forget(node, 1);
+        assert_eq!(
+            mutex(&forgotten).as_slice(),
+            [Some(PathBuf::from("/new")), Some(PathBuf::from("/new"))]
+        );
+    }
+
+    #[test]
+    fn forget_reports_none_after_the_last_name_is_unlinked() {
+        let recording = RecordingFs::default();
+        let forgotten = Arc::clone(&recording.forgotten_paths);
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let node = found(runtime.lookup(1, OsStr::new("gone"), &caller).unwrap());
+
+        runtime.unlink(1, OsStr::new("gone"), &caller).unwrap();
+        runtime.forget(node, 1);
+
+        assert_eq!(mutex(&forgotten).as_slice(), [None]);
     }
 
     #[test]
