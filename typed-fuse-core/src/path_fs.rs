@@ -1,10 +1,11 @@
 //! A synchronous path-based filesystem interface and its [`NodeFs`] adapter.
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{
     Caller, ConnInfo, Cx, DirSink, Errno, FileKind, FileLock, NodeAttr, NodeFs, NodeId, Opened,
@@ -152,6 +153,20 @@ pub trait PathFilesystem: Send + Sync + Sized {
     type Handle: Send + Sync;
     /// Per-open-directory data. Use `()` if not needed.
     type DirHandle: Send + Sync;
+
+    /// Optional filesystem-owned state retained by each path node for its
+    /// lifetime. This is useful for caches whose validity follows the FUSE
+    /// node, such as a parsed per-directory metadata file.
+    ///
+    /// The value is intentionally opaque to the adapter. Filesystems that do
+    /// not need node-local state can keep the default implementation.
+    fn node_state(
+        &self,
+        _path: &Path,
+        _kind: FileKind,
+    ) -> Result<Option<Arc<dyn Any + Send + Sync>>, Errno> {
+        Ok(None)
+    }
 
     /// Set to `true` to enable [`PathFilesystem::getlk`]/[`PathFilesystem::setlk`].
     /// Left disabled by default since most filesystems delegate POSIX
@@ -544,9 +559,18 @@ pub trait PathFilesystem: Send + Sync + Sized {
 
 /// The [`NodeFs::Node`] payload used by [`PathNodeFs`]. Opaque; filesystems
 /// interact with [`PathFilesystem`] purely in terms of paths.
-#[derive(Debug)]
 pub struct PathNode {
     key: u64,
+    state: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for PathNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PathNode")
+            .field("key", &self.key)
+            .field("has_state", &self.state.is_some())
+            .finish()
+    }
 }
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -588,7 +612,13 @@ impl Namespace {
         Some(parent)
     }
 
-    fn insert(&mut self, cx: &Cx<'_, PathNode>, parent: NodeId, name: &OsStr) -> (NodeId, bool) {
+    fn insert(
+        &mut self,
+        cx: &Cx<'_, PathNode>,
+        parent: NodeId,
+        name: &OsStr,
+        state: Option<Arc<dyn Any + Send + Sync>>,
+    ) -> (NodeId, bool) {
         let dentry = Dentry {
             parent,
             name: name.to_os_string(),
@@ -601,7 +631,7 @@ impl Namespace {
             .next_key
             .checked_add(1)
             .expect("path node key overflow");
-        let id = cx.insert(PathNode { key }, parent);
+        let id = cx.insert(PathNode { key, state }, parent);
         self.keys.insert(key, id);
         self.by_name.insert(dentry.clone(), id);
         self.aliases.entry(id).or_default().insert(dentry);
@@ -657,8 +687,20 @@ impl<P> PathNodeFs<P> {
     fn path(&self, id: NodeId) -> Result<PathBuf, Errno> {
         mutex(&self.namespace).path_for(id).ok_or(Errno::ENOENT)
     }
-    fn add_node(&self, cx: &Cx<'_, PathNode>, parent: NodeId, name: &OsStr) -> NodeId {
-        mutex(&self.namespace).insert(cx, parent, name).0
+    fn add_node(
+        &self,
+        cx: &Cx<'_, PathNode>,
+        parent: NodeId,
+        name: &OsStr,
+        kind: FileKind,
+    ) -> Result<NodeId, Errno>
+    where
+        P: PathFilesystem,
+    {
+        let mut path = self.path(parent)?;
+        path.push(name);
+        let state = self.inner.node_state(&path, kind)?;
+        Ok(mutex(&self.namespace).insert(cx, parent, name, state).0)
     }
 
     fn add_enumerated_node(
@@ -666,13 +708,20 @@ impl<P> PathNodeFs<P> {
         cx: &Cx<'_, PathNode>,
         parent: NodeId,
         name: &OsStr,
-    ) -> (NodeId, Option<Dentry>) {
-        let (id, inserted) = mutex(&self.namespace).insert(cx, parent, name);
+        kind: FileKind,
+    ) -> Result<(NodeId, Option<Dentry>), Errno>
+    where
+        P: PathFilesystem,
+    {
+        let mut path = self.path(parent)?;
+        path.push(name);
+        let state = self.inner.node_state(&path, kind)?;
+        let (id, inserted) = mutex(&self.namespace).insert(cx, parent, name, state);
         let dentry = inserted.then(|| Dentry {
             parent,
             name: name.to_os_string(),
         });
-        (id, dentry)
+        Ok((id, dentry))
     }
 
     fn rollback_dentry(&self, cx: &Cx<'_, PathNode>, dentry: &Dentry) {
@@ -692,7 +741,10 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     const SUPPORTS_READDIRPLUS: bool = P::SUPPORTS_READDIRPLUS;
 
     fn root(&mut self) -> Self::Node {
-        PathNode { key: 1 }
+        PathNode {
+            key: 1,
+            state: None,
+        }
     }
     fn init(&self, conn: &mut ConnInfo) {
         self.inner.init(conn)
@@ -738,10 +790,10 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     ) -> Result<Option<NodeId>, Errno> {
         let _guard = read_lock(&self.operations);
         let parent_path = self.path(parent)?;
-        if self.inner.lookup(&parent_path, name, caller)?.is_none() {
+        let Some(attr) = self.inner.lookup(&parent_path, name, caller)? else {
             return Ok(None);
-        }
-        Ok(Some(self.add_node(cx, parent, name)))
+        };
+        Ok(Some(self.add_node(cx, parent, name, attr.kind)?))
     }
 
     fn readlink(&self, node: &PathNode, caller: &Caller) -> Result<PathBuf, Errno> {
@@ -761,9 +813,10 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
         let _guard = write_lock(&self.operations);
-        self.inner
+        let attr = self
+            .inner
             .mknod(&self.path(parent)?, name, mode, rdev, umask, caller)?;
-        Ok(self.add_node(cx, parent, name))
+        Ok(self.add_node(cx, parent, name, attr.kind)?)
     }
 
     fn mkdir(
@@ -776,9 +829,10 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
         let _guard = write_lock(&self.operations);
-        self.inner
+        let attr = self
+            .inner
             .mkdir(&self.path(parent)?, name, mode, umask, caller)?;
-        Ok(self.add_node(cx, parent, name))
+        Ok(self.add_node(cx, parent, name, attr.kind)?)
     }
 
     fn symlink(
@@ -790,9 +844,10 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
         let _guard = write_lock(&self.operations);
-        self.inner
+        let attr = self
+            .inner
             .symlink(&self.path(parent)?, name, target, caller)?;
-        Ok(self.add_node(cx, parent, name))
+        Ok(self.add_node(cx, parent, name, attr.kind)?)
     }
 
     fn unlink(
@@ -970,14 +1025,16 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
             parent,
             output: sink,
             inserted: Vec::new(),
+            error: None,
         };
         let result = self
             .inner
             .readdir(&path, handle, offset, &mut adapter, caller);
-        if result.is_err() {
+        if result.is_err() || adapter.error.is_some() {
             adapter.rollback();
         }
-        result
+        result?;
+        adapter.error.map_or(Ok(()), Err)
     }
 
     fn readdirplus(
@@ -1000,14 +1057,16 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
             parent,
             output: sink,
             inserted: Vec::new(),
+            error: None,
         };
         let result = self
             .inner
             .readdirplus(&path, handle, offset, &mut adapter, caller);
-        if result.is_err() {
+        if result.is_err() || adapter.error.is_some() {
             adapter.rollback();
         }
-        result
+        result?;
+        adapter.error.map_or(Ok(()), Err)
     }
 
     fn releasedir(
@@ -1100,10 +1159,10 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         caller: &Caller,
     ) -> Result<(NodeId, Opened<P::Handle>), Errno> {
         let _g = write_lock(&self.operations);
-        let (_, opened) =
+        let (attr, opened) =
             self.inner
                 .create(&self.path(parent)?, name, mode, umask, flags, caller)?;
-        Ok((self.add_node(cx, parent, name), opened))
+        Ok((self.add_node(cx, parent, name, attr.kind)?, opened))
     }
     fn fallocate(
         &self,
@@ -1205,6 +1264,7 @@ struct BasicSink<'a, 'b, P> {
     parent: NodeId,
     output: &'a mut dyn DirSink,
     inserted: Vec<Dentry>,
+    error: Option<Errno>,
 }
 impl<P: PathFilesystem> BasicSink<'_, '_, P> {
     fn rollback(&mut self) {
@@ -1220,7 +1280,16 @@ impl<P: PathFilesystem> PathDirSink for BasicSink<'_, '_, P> {
         } else if name == OsStr::new("..") {
             (self.parent, None)
         } else {
-            self.owner.add_enumerated_node(self.cx, self.this, name)
+            match self
+                .owner
+                .add_enumerated_node(self.cx, self.this, name, kind)
+            {
+                Ok(node) => node,
+                Err(error) => {
+                    self.error = Some(error);
+                    return false;
+                }
+            }
         };
         let accepted = self.output.add(name, id, kind, next_offset);
         if let Some(dentry) = inserted {
@@ -1240,6 +1309,7 @@ struct PlusSink<'a, 'b, P> {
     parent: NodeId,
     output: &'a mut dyn PlusDirSink,
     inserted: Vec<Dentry>,
+    error: Option<Errno>,
 }
 impl<P: PathFilesystem> PlusSink<'_, '_, P> {
     fn rollback(&mut self) {
@@ -1255,7 +1325,16 @@ impl<P: PathFilesystem> PathPlusDirSink for PlusSink<'_, '_, P> {
         } else if name == OsStr::new("..") {
             (self.parent, None)
         } else {
-            self.owner.add_enumerated_node(self.cx, self.this, name)
+            match self
+                .owner
+                .add_enumerated_node(self.cx, self.this, name, attr.kind)
+            {
+                Ok(node) => node,
+                Err(error) => {
+                    self.error = Some(error);
+                    return false;
+                }
+            }
         };
         let accepted = self.output.add(name, id, attr, next_offset);
         if let Some(dentry) = inserted {
