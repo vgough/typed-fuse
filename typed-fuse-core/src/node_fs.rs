@@ -302,6 +302,13 @@ pub trait NodeFs: Sized + Send + Sync {
     /// Called on filesystem exit.
     fn destroy(&self) {}
 
+    /// Called when the kernel's lookup count for `node` reaches zero.
+    ///
+    /// This notification is independent of the node's link and open-handle
+    /// counts: the runtime may retain the node after this callback returns.
+    /// It has no result because FUSE forget requests do not receive replies.
+    fn forget(&self, node: &Self::Node) {}
+
     /// Returns the attributes of `node`, including its current link count.
     /// `handle` is the open file/dir handle if the call arrived through one,
     /// or `None` (e.g. an `fstat` on a path rather than a descriptor).

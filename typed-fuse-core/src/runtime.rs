@@ -432,11 +432,33 @@ impl<F: NodeFs> Runtime<F> {
         self.fs.destroy();
     }
     pub fn forget(&self, ino: u64, nlookup: u64) {
-        let mut t = lock(&self.shared.table);
-        if let Some(s) = t.map.get_mut(&ino) {
-            s.lookups = s.lookups.saturating_sub(nlookup);
+        let id = NodeId::from_ino(ino);
+        let forgotten = {
+            let mut table = lock(&self.shared.table);
+            let Some(slot) = table.map.get_mut(&ino) else {
+                return;
+            };
+            let had_lookups = slot.lookups != 0;
+            slot.lookups = slot.lookups.saturating_sub(nlookup);
+            if had_lookups && slot.lookups == 0 {
+                slot.leases = slot
+                    .leases
+                    .checked_add(1)
+                    .expect("node lease count overflow");
+                Some(NodeRef {
+                    id,
+                    record: Arc::clone(&slot.record),
+                    shared: Arc::clone(&self.shared),
+                })
+            } else {
+                None
+            }
+        };
+        if let Some(node) = forgotten {
+            self.fs.forget(&node);
+        } else {
+            lock(&self.shared.table).maybe_drop(id);
         }
-        t.maybe_drop(NodeId::from_ino(ino));
     }
     pub fn statfs(&self, _ino: u64, caller: &Caller) -> Result<StatFs, Errno> {
         self.fs.statfs(caller)
@@ -1047,6 +1069,63 @@ mod tests {
         let (e2, _) = rt.create(1, OsStr::new("g"), 0, 0, 0, &caller()).unwrap();
         assert_eq!(e2.ino, e.ino);
         assert_eq!(e2.generation, 1);
+    }
+
+    struct ForgetFs {
+        child: Mutex<Option<NodeId>>,
+        notifications: AtomicUsize,
+    }
+    impl NodeFs for ForgetFs {
+        type Node = ();
+        type Handle = ();
+        type DirHandle = ();
+
+        fn root(&mut self) {}
+        fn populate(&mut self, cx: &Cx<'_, ()>) {
+            *lock(&self.child) = Some(cx.insert((), NodeId::ROOT));
+        }
+        fn getattr(&self, _: &(), _: Option<&()>, _: &Caller) -> Result<NodeAttr, Errno> {
+            Ok(NodeAttr::default())
+        }
+        fn lookup(
+            &self,
+            _: &Cx<'_, ()>,
+            _: NodeId,
+            _: &OsStr,
+            _: &Caller,
+        ) -> Result<Option<NodeId>, Errno> {
+            Ok(*lock(&self.child))
+        }
+        fn forget(&self, _: &()) {
+            self.notifications.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn forget_notifies_only_on_zero_lookup_transitions() {
+        let rt = Runtime::new(ForgetFs {
+            child: Mutex::new(None),
+            notifications: AtomicUsize::new(0),
+        });
+        let LookupReply::Found(entry) = rt.lookup(1, OsStr::new("child"), &caller()).unwrap()
+        else {
+            panic!("unexpected negative lookup");
+        };
+        let child = entry.ino;
+
+        rt.forget(child, 0);
+        rt.forget(child, 1);
+        rt.forget(child, 1);
+        rt.forget(999, 1);
+        assert_eq!(rt.fs.notifications.load(Ordering::SeqCst), 1);
+
+        let LookupReply::Found(entry) = rt.lookup(1, OsStr::new("child"), &caller()).unwrap()
+        else {
+            panic!("unexpected negative lookup");
+        };
+        assert_eq!(entry.ino, child);
+        rt.forget(child, u64::MAX);
+        assert_eq!(rt.fs.notifications.load(Ordering::SeqCst), 2);
     }
 
     #[test]
