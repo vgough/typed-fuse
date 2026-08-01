@@ -3,36 +3,29 @@ name: CI
 on:
   push:
     branches:
-      - '**'
+      - main
     tags:
       - '*'
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build-ubuntu-typed-fuse:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install libfuse3-dev
-        run: sudo apt-get install -y libfuse3-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: cargo build --features fuse_35 --examples --verbose
+        run: cargo build --workspace --examples --verbose
 
       - name: Test
         run: cargo test --workspace --verbose
-
-
-  build-macos-11:
-    runs-on: macos-11
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-
-      - name: Install osxfuse
-        run: brew install osxfuse
-
-      - name: Build
-        run: cargo build --verbose
