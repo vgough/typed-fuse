@@ -393,7 +393,7 @@ impl<F: NodeFs> Runtime<F> {
 
     fn entry_for(&self, id: NodeId, caller: &Caller) -> Result<EntryReply, Errno> {
         let node = self.cx().get(id).ok_or(Errno::ENOENT)?;
-        let attr = self.fs.getattr(&node, None, caller)?;
+        let attr = self.fs.entry_attr(&node, caller)?;
         let mut table = lock(&self.shared.table);
         let slot = table.map.get_mut(&id.ino()).ok_or(Errno::ENOENT)?;
         let generation = slot.generation;

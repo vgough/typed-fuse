@@ -319,6 +319,15 @@ pub trait NodeFs: Sized + Send + Sync {
         caller: &Caller,
     ) -> Result<NodeAttr, Errno>;
 
+    /// Returns attributes for a newly looked-up or created entry.
+    ///
+    /// The default obtains the attributes normally. Adapters which already
+    /// received attributes while discovering the node can override this to
+    /// avoid issuing an immediate, duplicate `getattr` request.
+    fn entry_attr(&self, node: &Self::Node, caller: &Caller) -> Result<NodeAttr, Errno> {
+        self.getattr(node, None, caller)
+    }
+
     /// Applies the `Some` fields of `set` to `node`, returning the resulting
     /// attributes. `handle` is the open handle if the call arrived through
     /// one, or `None` otherwise.

@@ -677,6 +677,17 @@ pub trait PathFilesystem: Send + Sync + Sized {
 pub struct PathNode<S> {
     key: u64,
     state: Arc<S>,
+    entry_attr: Mutex<Option<NodeAttr>>,
+}
+
+impl<S> PathNode<S> {
+    fn set_entry_attr(&self, attr: NodeAttr) {
+        *mutex(&self.entry_attr) = Some(attr);
+    }
+
+    fn take_entry_attr(&self) -> Option<NodeAttr> {
+        mutex(&self.entry_attr).take()
+    }
 }
 
 impl<S> std::fmt::Debug for PathNode<S> {
@@ -743,7 +754,14 @@ impl Namespace {
             .next_key
             .checked_add(1)
             .expect("path node key overflow");
-        let id = cx.insert(PathNode { key, state }, parent);
+        let id = cx.insert(
+            PathNode {
+                key,
+                state,
+                entry_attr: Mutex::new(None),
+            },
+            parent,
+        );
         self.keys.insert(key, id);
         self.by_name.insert(dentry.clone(), id);
         self.aliases.entry(id).or_default().insert(dentry);
@@ -809,9 +827,11 @@ impl<P: PathFilesystem> PathNodeFs<P> {
     where
         P: PathFilesystem,
     {
-        Ok(mutex(&self.namespace)
+        let id = mutex(&self.namespace)
             .insert(cx, parent, name, entry.state)
-            .0)
+            .0;
+        cx.get(id).ok_or(Errno::ENOENT)?.set_entry_attr(entry.attr);
+        Ok(id)
     }
 
     fn add_enumerated_node(
@@ -852,6 +872,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         PathNode {
             key: 1,
             state: self.inner.root_state(),
+            entry_attr: Mutex::new(None),
         }
     }
     fn init(&self, conn: &mut ConnInfo) {
@@ -885,6 +906,18 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
             handle,
             caller,
         )
+    }
+
+    fn entry_attr(
+        &self,
+        node: &PathNode<P::NodeState>,
+        caller: &Caller,
+    ) -> Result<NodeAttr, Errno> {
+        if let Some(attr) = node.take_entry_attr() {
+            Ok(attr)
+        } else {
+            self.getattr(node, None, caller)
+        }
     }
 
     fn setattr(
@@ -1821,13 +1854,16 @@ mod tests {
             _name: &OsStr,
             _caller: &Caller,
         ) -> Result<Option<PathEntry<Self::NodeState>>, Errno> {
+            let state = self
+                .next_state
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
             Ok(Some(PathEntry::new(
-                NodeAttr::default(),
-                Arc::new(
-                    self.next_state
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1,
-                ),
+                NodeAttr {
+                    size: state as u64,
+                    ..Default::default()
+                },
+                Arc::new(state),
             )))
         }
 
@@ -1950,6 +1986,29 @@ mod tests {
             .map(|worker| worker.join().unwrap())
             .collect();
         assert!(ids.iter().all(|id| *id == ids[0]));
+    }
+
+    #[test]
+    fn lookup_replies_with_path_entry_attributes_without_getattr() {
+        let recording = RecordingFs::default();
+        let getattr_paths = Arc::clone(&recording.getattr_paths);
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+
+        let LookupReply::Found(first) = runtime.lookup(1, OsStr::new("entry"), &caller).unwrap()
+        else {
+            panic!("unexpected negative lookup");
+        };
+        assert_eq!(first.attr.size, 1);
+        assert!(mutex(&getattr_paths).is_empty());
+
+        let LookupReply::Found(second) = runtime.lookup(1, OsStr::new("entry"), &caller).unwrap()
+        else {
+            panic!("unexpected negative lookup");
+        };
+        assert_eq!(second.ino, first.ino);
+        assert_eq!(second.attr.size, 2);
+        assert!(mutex(&getattr_paths).is_empty());
     }
 
     #[test]
