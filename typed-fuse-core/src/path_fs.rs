@@ -1,6 +1,5 @@
 //! A synchronous path-based filesystem interface and its [`NodeFs`] adapter.
 
-use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -30,29 +29,69 @@ fn write_lock(value: &RwLock<()>) -> RwLockWriteGuard<'_, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The identity represented by a path-directory entry.
+pub enum PathDirIdentity<S> {
+    Current,
+    Parent,
+    Child(Arc<S>),
+}
+
+impl<S> Clone for PathDirIdentity<S> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Current => Self::Current,
+            Self::Parent => Self::Parent,
+            Self::Child(state) => Self::Child(Arc::clone(state)),
+        }
+    }
+}
+
+impl<S: std::fmt::Debug> std::fmt::Debug for PathDirIdentity<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Current => f.write_str("Current"),
+            Self::Parent => f.write_str("Parent"),
+            Self::Child(state) => f.debug_tuple("Child").field(state).finish(),
+        }
+    }
+}
+
 /// A directory-entry sink used by [`PathFilesystem::readdir`].
-pub trait PathDirSink {
+pub trait PathDirSink<S> {
     /// Adds one entry. `next_offset` is the resume cookie the kernel will
     /// hand back to continue after this entry. Returns `false` once the
     /// buffer is full, at which point the caller must stop iterating.
-    fn add(&mut self, name: &OsStr, kind: FileKind, next_offset: u64) -> bool;
+    fn add(
+        &mut self,
+        name: &OsStr,
+        kind: FileKind,
+        identity: PathDirIdentity<S>,
+        next_offset: u64,
+    ) -> bool;
 }
 
 /// A directory-entry sink used by [`PathFilesystem::readdirplus`].
-pub trait PathPlusDirSink {
+pub trait PathPlusDirSink<S> {
     /// Adds one entry with its attributes. `next_offset` is the resume
     /// cookie the kernel will hand back to continue after this entry.
     /// Returns `false` once the buffer is full, at which point the caller
     /// must stop iterating.
-    fn add(&mut self, name: &OsStr, attr: NodeAttr, next_offset: u64) -> bool;
+    fn add(
+        &mut self,
+        name: &OsStr,
+        attr: NodeAttr,
+        identity: PathDirIdentity<S>,
+        next_offset: u64,
+    ) -> bool;
 }
 
 /// One entry captured by [`DirBuffer`].
 #[derive(Clone, Debug)]
-pub struct DirEntry {
+pub struct DirEntry<S> {
     pub name: OsString,
     pub kind: FileKind,
     pub attr: NodeAttr,
+    pub identity: PathDirIdentity<S>,
 }
 
 /// An immutable snapshot of a directory's contents, suitable for use as a
@@ -65,11 +104,11 @@ pub struct DirEntry {
 /// bookkeeping (`next_offset = index + 1`) that the FUSE protocol requires
 /// filesystems to get right themselves.
 #[derive(Clone, Debug, Default)]
-pub struct DirBuffer {
-    entries: Vec<DirEntry>,
+pub struct DirBuffer<S> {
+    entries: Vec<DirEntry<S>>,
 }
 
-impl DirBuffer {
+impl<S> DirBuffer<S> {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -77,11 +116,18 @@ impl DirBuffer {
     }
 
     /// Appends one entry.
-    pub fn push(&mut self, name: impl Into<OsString>, kind: FileKind, attr: NodeAttr) {
+    pub fn push(
+        &mut self,
+        name: impl Into<OsString>,
+        kind: FileKind,
+        attr: NodeAttr,
+        state: Arc<S>,
+    ) {
         self.entries.push(DirEntry {
             name: name.into(),
             kind,
             attr,
+            identity: PathDirIdentity::Child(state),
         });
     }
 
@@ -90,8 +136,18 @@ impl DirBuffer {
     /// directory listings omit these, so callers building a buffer from one
     /// typically call this first.
     pub fn push_dots(&mut self, self_attr: NodeAttr, parent_attr: NodeAttr) {
-        self.push(".", FileKind::Directory, self_attr);
-        self.push("..", FileKind::Directory, parent_attr);
+        self.entries.push(DirEntry {
+            name: OsString::from("."),
+            kind: FileKind::Directory,
+            attr: self_attr,
+            identity: PathDirIdentity::Current,
+        });
+        self.entries.push(DirEntry {
+            name: OsString::from(".."),
+            kind: FileKind::Directory,
+            attr: parent_attr,
+            identity: PathDirIdentity::Parent,
+        });
     }
 
     pub fn len(&self) -> usize {
@@ -102,26 +158,58 @@ impl DirBuffer {
         self.entries.is_empty()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &DirEntry> {
+    pub fn iter(&self) -> impl Iterator<Item = &DirEntry<S>> {
         self.entries.iter()
     }
 
     /// Replays entries from `offset` onward into `sink`, per
     /// [`PathFilesystem::readdir`] semantics.
-    pub fn fill(&self, offset: u64, sink: &mut dyn PathDirSink) {
+    pub fn fill(&self, offset: u64, sink: &mut dyn PathDirSink<S>) {
         replay(offset, self.entries.len(), |entry, next_offset| {
             let entry = &self.entries[entry];
-            sink.add(&entry.name, entry.kind, next_offset)
+            sink.add(&entry.name, entry.kind, entry.identity.clone(), next_offset)
         });
     }
 
     /// Replays entries from `offset` onward into `sink`, per
     /// [`PathFilesystem::readdirplus`] semantics.
-    pub fn fill_plus(&self, offset: u64, sink: &mut dyn PathPlusDirSink) {
+    pub fn fill_plus(&self, offset: u64, sink: &mut dyn PathPlusDirSink<S>) {
         replay(offset, self.entries.len(), |entry, next_offset| {
             let entry = &self.entries[entry];
-            sink.add(&entry.name, entry.attr, next_offset)
+            sink.add(&entry.name, entry.attr, entry.identity.clone(), next_offset)
         });
+    }
+}
+
+/// Typed state and the adapter's current path for an existing node.
+pub struct PathNodeRef<'a, S> {
+    path: Option<&'a Path>,
+    state: &'a Arc<S>,
+}
+
+impl<'a, S> PathNodeRef<'a, S> {
+    pub fn path(&self) -> Option<&'a Path> {
+        self.path
+    }
+
+    pub fn state(&self) -> &'a S {
+        self.state
+    }
+
+    pub fn state_arc(&self) -> Arc<S> {
+        Arc::clone(self.state)
+    }
+}
+
+/// Attributes and typed state discovered or created for a path node.
+pub struct PathEntry<S> {
+    pub attr: NodeAttr,
+    pub state: Arc<S>,
+}
+
+impl<S> PathEntry<S> {
+    pub fn new(attr: NodeAttr, state: Arc<S>) -> Self {
+        Self { attr, state }
     }
 }
 
@@ -149,24 +237,16 @@ pub fn replay(offset: u64, len: usize, mut emit: impl FnMut(usize, u64) -> bool)
 /// the open object.
 #[allow(unused_variables)]
 pub trait PathFilesystem: Send + Sync + Sized {
+    /// Per-runtime-node data. Use `()` for stateless nodes.
+    type NodeState: Send + Sync + 'static;
     /// Per-open-file data. Use `()` if the filesystem is stateless per open.
     type Handle: Send + Sync;
     /// Per-open-directory data. Use `()` if not needed.
     type DirHandle: Send + Sync;
 
-    /// Optional filesystem-owned state retained by each path node for its
-    /// lifetime. This is useful for caches whose validity follows the FUSE
-    /// node, such as a parsed per-directory metadata file.
-    ///
-    /// The value is intentionally opaque to the adapter. Filesystems that do
-    /// not need node-local state can keep the default implementation.
-    fn node_state(
-        &self,
-        _path: &Path,
-        _kind: FileKind,
-    ) -> Result<Option<Arc<dyn Any + Send + Sync>>, Errno> {
-        Ok(None)
-    }
+    /// Builds state for the root node. This is infallible because runtime
+    /// construction itself cannot report an error.
+    fn root_state(&mut self) -> Arc<Self::NodeState>;
 
     /// Set to `true` to enable [`PathFilesystem::getlk`]/[`PathFilesystem::setlk`].
     /// Left disabled by default since most filesystems delegate POSIX
@@ -191,17 +271,17 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// `None` if its last known name has already been removed. This is a
     /// notification only: it may be delivered while the node still has links
     /// or open handles, and it cannot report an error.
-    fn forget(&self, path: Option<&Path>) {}
+    fn forget(&self, node: PathNodeRef<'_, Self::NodeState>) {}
 
     /// Looks up `name` in directory `parent`. Return `Ok(Some(attr))` for a
     /// hit, `Ok(None)` to populate the kernel's negative-lookup cache, or
     /// `Err` for a hard failure.
     fn lookup(
         &self,
-        parent: &Path,
+        parent: PathNodeRef<'_, Self::NodeState>,
         name: &OsStr,
         caller: &Caller,
-    ) -> Result<Option<NodeAttr>, Errno> {
+    ) -> Result<Option<PathEntry<Self::NodeState>>, Errno> {
         Err(Errno::ENOSYS)
     }
 
@@ -210,7 +290,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// is `None` if the open file's last known name has been unlinked.
     fn getattr(
         &self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: Option<&Self::Handle>,
         caller: &Caller,
     ) -> Result<NodeAttr, Errno>;
@@ -219,7 +299,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// attributes.
     fn setattr(
         &self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: Option<&Self::Handle>,
         set: &SetAttr,
         caller: &Caller,
@@ -228,7 +308,11 @@ pub trait PathFilesystem: Send + Sync + Sized {
     }
 
     /// Reads the target of the symbolic link at `path`.
-    fn readlink(&self, path: &Path, caller: &Caller) -> Result<PathBuf, Errno> {
+    fn readlink(
+        &self,
+        node: PathNodeRef<'_, Self::NodeState>,
+        caller: &Caller,
+    ) -> Result<PathBuf, Errno> {
         Err(Errno::ENOSYS)
     }
 
@@ -236,55 +320,65 @@ pub trait PathFilesystem: Send + Sync + Sized {
     #[allow(clippy::too_many_arguments)]
     fn mknod(
         &self,
-        parent: &Path,
+        parent: PathNodeRef<'_, Self::NodeState>,
         name: &OsStr,
         mode: u32,
         rdev: u32,
         umask: u32,
         caller: &Caller,
-    ) -> Result<NodeAttr, Errno> {
+    ) -> Result<PathEntry<Self::NodeState>, Errno> {
         Err(Errno::ENOSYS)
     }
 
     /// Creates a directory named `name` in `parent`.
     fn mkdir(
         &self,
-        parent: &Path,
+        parent: PathNodeRef<'_, Self::NodeState>,
         name: &OsStr,
         mode: u32,
         umask: u32,
         caller: &Caller,
-    ) -> Result<NodeAttr, Errno> {
+    ) -> Result<PathEntry<Self::NodeState>, Errno> {
         Err(Errno::ENOSYS)
     }
 
     /// Creates a symbolic link named `name` in `parent` pointing at `target`.
     fn symlink(
         &self,
-        parent: &Path,
+        parent: PathNodeRef<'_, Self::NodeState>,
         name: &OsStr,
         target: &Path,
         caller: &Caller,
-    ) -> Result<NodeAttr, Errno> {
+    ) -> Result<PathEntry<Self::NodeState>, Errno> {
         Err(Errno::ENOSYS)
     }
 
     /// Removes the non-directory entry `name` from `parent`.
-    fn unlink(&self, parent: &Path, name: &OsStr, caller: &Caller) -> Result<(), Errno> {
+    fn unlink(
+        &self,
+        parent: PathNodeRef<'_, Self::NodeState>,
+        name: &OsStr,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
     }
 
     /// Removes the empty directory `name` from `parent`.
-    fn rmdir(&self, parent: &Path, name: &OsStr, caller: &Caller) -> Result<(), Errno> {
+    fn rmdir(
+        &self,
+        parent: PathNodeRef<'_, Self::NodeState>,
+        name: &OsStr,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
     }
 
     /// Renames `name` in `parent` to `newname` in `newparent`.
     fn rename(
         &self,
-        parent: &Path,
+        parent: PathNodeRef<'_, Self::NodeState>,
         name: &OsStr,
-        newparent: &Path,
+        newparent: PathNodeRef<'_, Self::NodeState>,
         newname: &OsStr,
         caller: &Caller,
     ) -> Result<(), Errno> {
@@ -294,8 +388,8 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// Creates a hard link to `path` named `newname` in `newparent`.
     fn link(
         &self,
-        path: &Path,
-        newparent: &Path,
+        node: PathNodeRef<'_, Self::NodeState>,
+        newparent: PathNodeRef<'_, Self::NodeState>,
         newname: &OsStr,
         caller: &Caller,
     ) -> Result<NodeAttr, Errno> {
@@ -305,7 +399,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// Opens `path`, returning the filesystem's handle object.
     fn open(
         &self,
-        path: &Path,
+        node: PathNodeRef<'_, Self::NodeState>,
         flags: i32,
         caller: &Caller,
     ) -> Result<Opened<Self::Handle>, Errno> {
@@ -317,7 +411,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// `None` if the open file's last known name has been unlinked.
     fn read<'a>(
         &'a self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: &'a Self::Handle,
         offset: u64,
         size: usize,
@@ -329,7 +423,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// Writes `data` to `handle` at `offset`, returning the count written.
     fn write(
         &self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: &Self::Handle,
         data: &[u8],
         offset: u64,
@@ -341,7 +435,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// Called on each `close()` of an open file.
     fn flush(
         &self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: &Self::Handle,
         caller: &Caller,
     ) -> Result<(), Errno> {
@@ -352,7 +446,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// the handle.
     fn release(
         &self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: Self::Handle,
         caller: &Caller,
     ) -> Result<(), Errno> {
@@ -362,7 +456,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// Flushes file contents (and metadata unless `datasync`).
     fn fsync(
         &self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: &Self::Handle,
         datasync: bool,
         caller: &Caller,
@@ -373,7 +467,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// Opens the directory at `path`.
     fn opendir(
         &self,
-        path: &Path,
+        node: PathNodeRef<'_, Self::NodeState>,
         flags: i32,
         caller: &Caller,
     ) -> Result<Opened<Self::DirHandle>, Errno> {
@@ -385,10 +479,10 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// cookie and stop as soon as [`PathDirSink::add`] returns `false`.
     fn readdir(
         &self,
-        path: &Path,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: &Self::DirHandle,
         offset: u64,
-        sink: &mut dyn PathDirSink,
+        sink: &mut dyn PathDirSink<Self::NodeState>,
         caller: &Caller,
     ) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
@@ -399,10 +493,10 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// [`PathFilesystem::SUPPORTS_READDIRPLUS`] is `true`.
     fn readdirplus(
         &self,
-        path: &Path,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: &Self::DirHandle,
         offset: u64,
-        sink: &mut dyn PathPlusDirSink,
+        sink: &mut dyn PathPlusDirSink<Self::NodeState>,
         caller: &Caller,
     ) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
@@ -411,7 +505,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// Releases a directory handle; consumes it.
     fn releasedir(
         &self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: Self::DirHandle,
         caller: &Caller,
     ) -> Result<(), Errno> {
@@ -421,7 +515,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// Flushes directory contents.
     fn fsyncdir(
         &self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: &Self::DirHandle,
         datasync: bool,
         caller: &Caller,
@@ -442,7 +536,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// Sets extended attribute `name` on `path`.
     fn setxattr(
         &self,
-        path: &Path,
+        node: PathNodeRef<'_, Self::NodeState>,
         name: &OsStr,
         value: &[u8],
         flags: i32,
@@ -454,7 +548,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// length query (return [`XattrReply::Size`]).
     fn getxattr(
         &self,
-        path: &Path,
+        node: PathNodeRef<'_, Self::NodeState>,
         name: &OsStr,
         size: usize,
         caller: &Caller,
@@ -463,15 +557,30 @@ pub trait PathFilesystem: Send + Sync + Sized {
     }
     /// Returns the NUL-separated extended attribute names on `path`. Same
     /// size-query protocol as [`PathFilesystem::getxattr`].
-    fn listxattr(&self, path: &Path, size: usize, caller: &Caller) -> Result<XattrReply, Errno> {
+    fn listxattr(
+        &self,
+        node: PathNodeRef<'_, Self::NodeState>,
+        size: usize,
+        caller: &Caller,
+    ) -> Result<XattrReply, Errno> {
         Err(Errno::ENOSYS)
     }
     /// Removes extended attribute `name` from `path`.
-    fn removexattr(&self, path: &Path, name: &OsStr, caller: &Caller) -> Result<(), Errno> {
+    fn removexattr(
+        &self,
+        node: PathNodeRef<'_, Self::NodeState>,
+        name: &OsStr,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
     }
     /// Checks access to `path` per the `access(2)` `mask`.
-    fn access(&self, path: &Path, mask: i32, caller: &Caller) -> Result<(), Errno> {
+    fn access(
+        &self,
+        node: PathNodeRef<'_, Self::NodeState>,
+        mask: i32,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
         Ok(())
     }
 
@@ -479,20 +588,20 @@ pub trait PathFilesystem: Send + Sync + Sized {
     #[allow(clippy::too_many_arguments)]
     fn create(
         &self,
-        parent: &Path,
+        parent: PathNodeRef<'_, Self::NodeState>,
         name: &OsStr,
         mode: u32,
         umask: u32,
         flags: i32,
         caller: &Caller,
-    ) -> Result<(NodeAttr, Opened<Self::Handle>), Errno> {
+    ) -> Result<(PathEntry<Self::NodeState>, Opened<Self::Handle>), Errno> {
         Err(Errno::ENOSYS)
     }
 
     /// Pre-allocates/punches `length` bytes at `offset` in `handle`.
     fn fallocate(
         &self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: &Self::Handle,
         mode: i32,
         offset: u64,
@@ -504,7 +613,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// Finds the next data region or hole at or after `offset`.
     fn lseek(
         &self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: &Self::Handle,
         offset: u64,
         whence: i32,
@@ -518,7 +627,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// [`PathFilesystem::SUPPORTS_POSIX_LOCKS`] is `true`.
     fn getlk(
         &self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: &Self::Handle,
         owner: u64,
         lock: FileLock,
@@ -532,7 +641,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// [`PathFilesystem::SUPPORTS_POSIX_LOCKS`] is `true`.
     fn setlk(
         &self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: &Self::Handle,
         owner: u64,
         lock: FileLock,
@@ -548,7 +657,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// [`PathFilesystem::SUPPORTS_FLOCK`] is `true`.
     fn flock(
         &self,
-        path: Option<&Path>,
+        node: PathNodeRef<'_, Self::NodeState>,
         handle: &Self::Handle,
         operation: i32,
         caller: &Caller,
@@ -559,17 +668,14 @@ pub trait PathFilesystem: Send + Sync + Sized {
 
 /// The [`NodeFs::Node`] payload used by [`PathNodeFs`]. Opaque; filesystems
 /// interact with [`PathFilesystem`] purely in terms of paths.
-pub struct PathNode {
+pub struct PathNode<S> {
     key: u64,
-    state: Option<Arc<dyn Any + Send + Sync>>,
+    state: Arc<S>,
 }
 
-impl std::fmt::Debug for PathNode {
+impl<S> std::fmt::Debug for PathNode<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PathNode")
-            .field("key", &self.key)
-            .field("has_state", &self.state.is_some())
-            .finish()
+        f.debug_struct("PathNode").field("key", &self.key).finish()
     }
 }
 
@@ -598,7 +704,7 @@ impl Namespace {
         }
     }
 
-    fn id_for_node(&self, node: &PathNode) -> Option<NodeId> {
+    fn id_for_node<S>(&self, node: &PathNode<S>) -> Option<NodeId> {
         self.keys.get(&node.key).copied()
     }
 
@@ -612,12 +718,12 @@ impl Namespace {
         Some(parent)
     }
 
-    fn insert(
+    fn insert<S>(
         &mut self,
-        cx: &Cx<'_, PathNode>,
+        cx: &Cx<'_, PathNode<S>>,
         parent: NodeId,
         name: &OsStr,
-        state: Option<Arc<dyn Any + Send + Sync>>,
+        state: Arc<S>,
     ) -> (NodeId, bool) {
         let dentry = Dentry {
             parent,
@@ -662,7 +768,7 @@ pub struct PathNodeFs<P> {
     namespace: Mutex<Namespace>,
 }
 
-impl<P> PathNodeFs<P> {
+impl<P: PathFilesystem> PathNodeFs<P> {
     /// Wraps `inner` for use with the node-based [`Runtime`](crate::Runtime).
     pub fn new(inner: P) -> Self {
         Self {
@@ -677,10 +783,10 @@ impl<P> PathNodeFs<P> {
         self.inner
     }
 
-    fn node_id(&self, node: &PathNode) -> Option<NodeId> {
+    fn node_id(&self, node: &PathNode<P::NodeState>) -> Option<NodeId> {
         mutex(&self.namespace).id_for_node(node)
     }
-    fn node_path(&self, node: &PathNode) -> Option<PathBuf> {
+    fn node_path(&self, node: &PathNode<P::NodeState>) -> Option<PathBuf> {
         self.node_id(node)
             .and_then(|id| mutex(&self.namespace).path_for(id))
     }
@@ -689,33 +795,29 @@ impl<P> PathNodeFs<P> {
     }
     fn add_node(
         &self,
-        cx: &Cx<'_, PathNode>,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
         parent: NodeId,
         name: &OsStr,
-        kind: FileKind,
+        entry: PathEntry<P::NodeState>,
     ) -> Result<NodeId, Errno>
     where
         P: PathFilesystem,
     {
-        let mut path = self.path(parent)?;
-        path.push(name);
-        let state = self.inner.node_state(&path, kind)?;
-        Ok(mutex(&self.namespace).insert(cx, parent, name, state).0)
+        Ok(mutex(&self.namespace)
+            .insert(cx, parent, name, entry.state)
+            .0)
     }
 
     fn add_enumerated_node(
         &self,
-        cx: &Cx<'_, PathNode>,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
         parent: NodeId,
         name: &OsStr,
-        kind: FileKind,
+        state: Arc<P::NodeState>,
     ) -> Result<(NodeId, Option<Dentry>), Errno>
     where
         P: PathFilesystem,
     {
-        let mut path = self.path(parent)?;
-        path.push(name);
-        let state = self.inner.node_state(&path, kind)?;
         let (id, inserted) = mutex(&self.namespace).insert(cx, parent, name, state);
         let dentry = inserted.then(|| Dentry {
             parent,
@@ -724,7 +826,7 @@ impl<P> PathNodeFs<P> {
         Ok((id, dentry))
     }
 
-    fn rollback_dentry(&self, cx: &Cx<'_, PathNode>, dentry: &Dentry) {
+    fn rollback_dentry(&self, cx: &Cx<'_, PathNode<P::NodeState>>, dentry: &Dentry) {
         if let Some(id) = mutex(&self.namespace).remove(dentry) {
             cx.remove_link(id);
         }
@@ -732,7 +834,7 @@ impl<P> PathNodeFs<P> {
 }
 
 impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
-    type Node = PathNode;
+    type Node = PathNode<P::NodeState>;
     type Handle = P::Handle;
     type DirHandle = P::DirHandle;
 
@@ -743,7 +845,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     fn root(&mut self) -> Self::Node {
         PathNode {
             key: 1,
-            state: None,
+            state: self.inner.root_state(),
         }
     }
     fn init(&self, conn: &mut ConnInfo) {
@@ -752,59 +854,92 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     fn destroy(&self) {
         self.inner.destroy()
     }
-    fn forget(&self, node: &PathNode) {
+    fn forget(&self, node: &PathNode<P::NodeState>) {
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node);
-        self.inner.forget(path.as_deref());
+        self.inner.forget(PathNodeRef {
+            path: path.as_deref(),
+            state: &node.state,
+        });
     }
 
     fn getattr(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         handle: Option<&P::Handle>,
         caller: &Caller,
     ) -> Result<NodeAttr, Errno> {
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node);
-        self.inner.getattr(path.as_deref(), handle, caller)
+        self.inner.getattr(
+            PathNodeRef {
+                path: path.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            caller,
+        )
     }
 
     fn setattr(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         handle: Option<&P::Handle>,
         set: &SetAttr,
         caller: &Caller,
     ) -> Result<NodeAttr, Errno> {
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node);
-        self.inner.setattr(path.as_deref(), handle, set, caller)
+        self.inner.setattr(
+            PathNodeRef {
+                path: path.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            set,
+            caller,
+        )
     }
 
     fn lookup(
         &self,
-        cx: &Cx<'_, PathNode>,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
         parent: NodeId,
         name: &OsStr,
         caller: &Caller,
     ) -> Result<Option<NodeId>, Errno> {
         let _guard = read_lock(&self.operations);
+        let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         let parent_path = self.path(parent)?;
-        let Some(attr) = self.inner.lookup(&parent_path, name, caller)? else {
+        let Some(entry) = self.inner.lookup(
+            PathNodeRef {
+                path: Some(&parent_path),
+                state: &parent_node.state,
+            },
+            name,
+            caller,
+        )?
+        else {
             return Ok(None);
         };
-        Ok(Some(self.add_node(cx, parent, name, attr.kind)?))
+        Ok(Some(self.add_node(cx, parent, name, entry)?))
     }
 
-    fn readlink(&self, node: &PathNode, caller: &Caller) -> Result<PathBuf, Errno> {
+    fn readlink(&self, node: &PathNode<P::NodeState>, caller: &Caller) -> Result<PathBuf, Errno> {
         let _guard = read_lock(&self.operations);
-        self.inner
-            .readlink(&self.node_path(node).ok_or(Errno::ENOENT)?, caller)
+        let path = self.node_path(node).ok_or(Errno::ENOENT)?;
+        self.inner.readlink(
+            PathNodeRef {
+                path: Some(&path),
+                state: &node.state,
+            },
+            caller,
+        )
     }
 
     fn mknod(
         &self,
-        cx: &Cx<'_, PathNode>,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
         parent: NodeId,
         name: &OsStr,
         mode: u32,
@@ -813,15 +948,25 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
         let _guard = write_lock(&self.operations);
-        let attr = self
-            .inner
-            .mknod(&self.path(parent)?, name, mode, rdev, umask, caller)?;
-        Ok(self.add_node(cx, parent, name, attr.kind)?)
+        let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
+        let parent_path = self.path(parent)?;
+        let entry = self.inner.mknod(
+            PathNodeRef {
+                path: Some(&parent_path),
+                state: &parent_node.state,
+            },
+            name,
+            mode,
+            rdev,
+            umask,
+            caller,
+        )?;
+        Ok(self.add_node(cx, parent, name, entry)?)
     }
 
     fn mkdir(
         &self,
-        cx: &Cx<'_, PathNode>,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
         parent: NodeId,
         name: &OsStr,
         mode: u32,
@@ -829,30 +974,47 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
         let _guard = write_lock(&self.operations);
-        let attr = self
-            .inner
-            .mkdir(&self.path(parent)?, name, mode, umask, caller)?;
-        Ok(self.add_node(cx, parent, name, attr.kind)?)
+        let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
+        let parent_path = self.path(parent)?;
+        let entry = self.inner.mkdir(
+            PathNodeRef {
+                path: Some(&parent_path),
+                state: &parent_node.state,
+            },
+            name,
+            mode,
+            umask,
+            caller,
+        )?;
+        Ok(self.add_node(cx, parent, name, entry)?)
     }
 
     fn symlink(
         &self,
-        cx: &Cx<'_, PathNode>,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
         parent: NodeId,
         name: &OsStr,
         target: &Path,
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
         let _guard = write_lock(&self.operations);
-        let attr = self
-            .inner
-            .symlink(&self.path(parent)?, name, target, caller)?;
-        Ok(self.add_node(cx, parent, name, attr.kind)?)
+        let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
+        let parent_path = self.path(parent)?;
+        let entry = self.inner.symlink(
+            PathNodeRef {
+                path: Some(&parent_path),
+                state: &parent_node.state,
+            },
+            name,
+            target,
+            caller,
+        )?;
+        Ok(self.add_node(cx, parent, name, entry)?)
     }
 
     fn unlink(
         &self,
-        cx: &Cx<'_, PathNode>,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
         parent: NodeId,
         name: &OsStr,
         caller: &Caller,
@@ -862,7 +1024,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
 
     fn rmdir(
         &self,
-        cx: &Cx<'_, PathNode>,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
         parent: NodeId,
         name: &OsStr,
         caller: &Caller,
@@ -872,7 +1034,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
 
     fn rename(
         &self,
-        cx: &Cx<'_, PathNode>,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
         parent: NodeId,
         name: &OsStr,
         newparent: NodeId,
@@ -884,10 +1046,23 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
             return Err(Errno::EOPNOTSUPP);
         }
         let _guard = write_lock(&self.operations);
+        let old_parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
+        let new_parent_node = cx.get(newparent).ok_or(Errno::ENOENT)?;
         let old_parent_path = self.path(parent)?;
         let new_parent_path = self.path(newparent)?;
-        self.inner
-            .rename(&old_parent_path, name, &new_parent_path, newname, caller)?;
+        self.inner.rename(
+            PathNodeRef {
+                path: Some(&old_parent_path),
+                state: &old_parent_node.state,
+            },
+            name,
+            PathNodeRef {
+                path: Some(&new_parent_path),
+                state: &new_parent_node.state,
+            },
+            newname,
+            caller,
+        )?;
         let old = Dentry {
             parent,
             name: name.to_os_string(),
@@ -914,16 +1089,29 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
 
     fn link(
         &self,
-        cx: &Cx<'_, PathNode>,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
         id: NodeId,
         newparent: NodeId,
         newname: &OsStr,
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
         let _guard = write_lock(&self.operations);
+        let source_node = cx.get(id).ok_or(Errno::ENOENT)?;
+        let parent_node = cx.get(newparent).ok_or(Errno::ENOENT)?;
         let source = self.path(id)?;
         let parent = self.path(newparent)?;
-        self.inner.link(&source, &parent, newname, caller)?;
+        self.inner.link(
+            PathNodeRef {
+                path: Some(&source),
+                state: &source_node.state,
+            },
+            PathNodeRef {
+                path: Some(&parent),
+                state: &parent_node.state,
+            },
+            newname,
+            caller,
+        )?;
         let dentry = Dentry {
             parent: newparent,
             name: newname.to_os_string(),
@@ -935,18 +1123,25 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
 
     fn open(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         flags: i32,
         caller: &Caller,
     ) -> Result<Opened<P::Handle>, Errno> {
         let _guard = read_lock(&self.operations);
-        self.inner
-            .open(&self.node_path(node).ok_or(Errno::ENOENT)?, flags, caller)
+        let path = self.node_path(node).ok_or(Errno::ENOENT)?;
+        self.inner.open(
+            PathNodeRef {
+                path: Some(&path),
+                state: &node.state,
+            },
+            flags,
+            caller,
+        )
     }
 
     fn read<'a>(
         &'a self,
-        node: &'a PathNode,
+        node: &'a PathNode<P::NodeState>,
         handle: &'a P::Handle,
         offset: u64,
         size: usize,
@@ -954,13 +1149,21 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     ) -> Result<Cow<'a, [u8]>, Errno> {
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node);
-        self.inner
-            .read(path.as_deref(), handle, offset, size, caller)
+        self.inner.read(
+            PathNodeRef {
+                path: path.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            offset,
+            size,
+            caller,
+        )
     }
 
     fn write(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         handle: &P::Handle,
         data: &[u8],
         offset: u64,
@@ -968,47 +1171,94 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     ) -> Result<usize, Errno> {
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node);
-        self.inner
-            .write(path.as_deref(), handle, data, offset, caller)
+        self.inner.write(
+            PathNodeRef {
+                path: path.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            data,
+            offset,
+            caller,
+        )
     }
 
-    fn flush(&self, node: &PathNode, handle: &P::Handle, caller: &Caller) -> Result<(), Errno> {
+    fn flush(
+        &self,
+        node: &PathNode<P::NodeState>,
+        handle: &P::Handle,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
-        self.inner.flush(p.as_deref(), handle, caller)
+        self.inner.flush(
+            PathNodeRef {
+                path: p.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            caller,
+        )
     }
-    fn release(&self, node: &PathNode, handle: P::Handle, caller: &Caller) -> Result<(), Errno> {
+    fn release(
+        &self,
+        node: &PathNode<P::NodeState>,
+        handle: P::Handle,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
-        self.inner.release(p.as_deref(), handle, caller)
+        self.inner.release(
+            PathNodeRef {
+                path: p.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            caller,
+        )
     }
     fn fsync(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         handle: &P::Handle,
         datasync: bool,
         caller: &Caller,
     ) -> Result<(), Errno> {
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
-        self.inner.fsync(p.as_deref(), handle, datasync, caller)
+        self.inner.fsync(
+            PathNodeRef {
+                path: p.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            datasync,
+            caller,
+        )
     }
 
     fn opendir(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         flags: i32,
         caller: &Caller,
     ) -> Result<Opened<P::DirHandle>, Errno> {
         let _g = read_lock(&self.operations);
-        self.inner
-            .opendir(&self.node_path(node).ok_or(Errno::ENOENT)?, flags, caller)
+        let path = self.node_path(node).ok_or(Errno::ENOENT)?;
+        self.inner.opendir(
+            PathNodeRef {
+                path: Some(&path),
+                state: &node.state,
+            },
+            flags,
+            caller,
+        )
     }
 
     fn readdir(
         &self,
-        cx: &Cx<'_, PathNode>,
-        node: &PathNode,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
+        node: &PathNode<P::NodeState>,
         this: NodeId,
         parent: NodeId,
         handle: &P::DirHandle,
@@ -1027,9 +1277,16 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
             inserted: Vec::new(),
             error: None,
         };
-        let result = self
-            .inner
-            .readdir(&path, handle, offset, &mut adapter, caller);
+        let result = self.inner.readdir(
+            PathNodeRef {
+                path: Some(&path),
+                state: &node.state,
+            },
+            handle,
+            offset,
+            &mut adapter,
+            caller,
+        );
         if result.is_err() || adapter.error.is_some() {
             adapter.rollback();
         }
@@ -1039,8 +1296,8 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
 
     fn readdirplus(
         &self,
-        cx: &Cx<'_, PathNode>,
-        node: &PathNode,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
+        node: &PathNode<P::NodeState>,
         this: NodeId,
         parent: NodeId,
         handle: &P::DirHandle,
@@ -1059,9 +1316,16 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
             inserted: Vec::new(),
             error: None,
         };
-        let result = self
-            .inner
-            .readdirplus(&path, handle, offset, &mut adapter, caller);
+        let result = self.inner.readdirplus(
+            PathNodeRef {
+                path: Some(&path),
+                state: &node.state,
+            },
+            handle,
+            offset,
+            &mut adapter,
+            caller,
+        );
         if result.is_err() || adapter.error.is_some() {
             adapter.rollback();
         }
@@ -1071,24 +1335,39 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
 
     fn releasedir(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         handle: P::DirHandle,
         caller: &Caller,
     ) -> Result<(), Errno> {
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
-        self.inner.releasedir(p.as_deref(), handle, caller)
+        self.inner.releasedir(
+            PathNodeRef {
+                path: p.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            caller,
+        )
     }
     fn fsyncdir(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         handle: &P::DirHandle,
         datasync: bool,
         caller: &Caller,
     ) -> Result<(), Errno> {
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
-        self.inner.fsyncdir(p.as_deref(), handle, datasync, caller)
+        self.inner.fsyncdir(
+            PathNodeRef {
+                path: p.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            datasync,
+            caller,
+        )
     }
     fn statfs(&self, caller: &Caller) -> Result<StatFs, Errno> {
         let _g = read_lock(&self.operations);
@@ -1097,15 +1376,19 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
 
     fn setxattr(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         name: &OsStr,
         value: &[u8],
         flags: i32,
         caller: &Caller,
     ) -> Result<(), Errno> {
         let _g = read_lock(&self.operations);
+        let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.setxattr(
-            &self.node_path(node).ok_or(Errno::ENOENT)?,
+            PathNodeRef {
+                path: Some(&path),
+                state: &node.state,
+            },
             name,
             value,
             flags,
@@ -1114,14 +1397,18 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     }
     fn getxattr(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         name: &OsStr,
         size: usize,
         caller: &Caller,
     ) -> Result<XattrReply, Errno> {
         let _g = read_lock(&self.operations);
+        let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.getxattr(
-            &self.node_path(node).ok_or(Errno::ENOENT)?,
+            PathNodeRef {
+                path: Some(&path),
+                state: &node.state,
+            },
             name,
             size,
             caller,
@@ -1129,28 +1416,59 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     }
     fn listxattr(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         size: usize,
         caller: &Caller,
     ) -> Result<XattrReply, Errno> {
         let _g = read_lock(&self.operations);
-        self.inner
-            .listxattr(&self.node_path(node).ok_or(Errno::ENOENT)?, size, caller)
+        let path = self.node_path(node).ok_or(Errno::ENOENT)?;
+        self.inner.listxattr(
+            PathNodeRef {
+                path: Some(&path),
+                state: &node.state,
+            },
+            size,
+            caller,
+        )
     }
-    fn removexattr(&self, node: &PathNode, name: &OsStr, caller: &Caller) -> Result<(), Errno> {
+    fn removexattr(
+        &self,
+        node: &PathNode<P::NodeState>,
+        name: &OsStr,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
         let _g = read_lock(&self.operations);
-        self.inner
-            .removexattr(&self.node_path(node).ok_or(Errno::ENOENT)?, name, caller)
+        let path = self.node_path(node).ok_or(Errno::ENOENT)?;
+        self.inner.removexattr(
+            PathNodeRef {
+                path: Some(&path),
+                state: &node.state,
+            },
+            name,
+            caller,
+        )
     }
-    fn access(&self, node: &PathNode, mask: i32, caller: &Caller) -> Result<(), Errno> {
+    fn access(
+        &self,
+        node: &PathNode<P::NodeState>,
+        mask: i32,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
         let _g = read_lock(&self.operations);
-        self.inner
-            .access(&self.node_path(node).ok_or(Errno::ENOENT)?, mask, caller)
+        let path = self.node_path(node).ok_or(Errno::ENOENT)?;
+        self.inner.access(
+            PathNodeRef {
+                path: Some(&path),
+                state: &node.state,
+            },
+            mask,
+            caller,
+        )
     }
 
     fn create(
         &self,
-        cx: &Cx<'_, PathNode>,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
         parent: NodeId,
         name: &OsStr,
         mode: u32,
@@ -1159,14 +1477,24 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         caller: &Caller,
     ) -> Result<(NodeId, Opened<P::Handle>), Errno> {
         let _g = write_lock(&self.operations);
-        let (attr, opened) =
-            self.inner
-                .create(&self.path(parent)?, name, mode, umask, flags, caller)?;
-        Ok((self.add_node(cx, parent, name, attr.kind)?, opened))
+        let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
+        let parent_path = self.path(parent)?;
+        let (entry, opened) = self.inner.create(
+            PathNodeRef {
+                path: Some(&parent_path),
+                state: &parent_node.state,
+            },
+            name,
+            mode,
+            umask,
+            flags,
+            caller,
+        )?;
+        Ok((self.add_node(cx, parent, name, entry)?, opened))
     }
     fn fallocate(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         handle: &P::Handle,
         mode: i32,
         offset: u64,
@@ -1175,12 +1503,21 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     ) -> Result<(), Errno> {
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
-        self.inner
-            .fallocate(p.as_deref(), handle, mode, offset, length, caller)
+        self.inner.fallocate(
+            PathNodeRef {
+                path: p.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            mode,
+            offset,
+            length,
+            caller,
+        )
     }
     fn lseek(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         handle: &P::Handle,
         offset: u64,
         whence: i32,
@@ -1188,12 +1525,20 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     ) -> Result<u64, Errno> {
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
-        self.inner
-            .lseek(p.as_deref(), handle, offset, whence, caller)
+        self.inner.lseek(
+            PathNodeRef {
+                path: p.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            offset,
+            whence,
+            caller,
+        )
     }
     fn getlk(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         handle: &P::Handle,
         owner: u64,
         lock: FileLock,
@@ -1201,11 +1546,20 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     ) -> Result<FileLock, Errno> {
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
-        self.inner.getlk(p.as_deref(), handle, owner, lock, caller)
+        self.inner.getlk(
+            PathNodeRef {
+                path: p.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            owner,
+            lock,
+            caller,
+        )
     }
     fn setlk(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         handle: &P::Handle,
         owner: u64,
         lock: FileLock,
@@ -1214,37 +1568,69 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     ) -> Result<(), Errno> {
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
-        self.inner
-            .setlk(p.as_deref(), handle, owner, lock, sleep, caller)
+        self.inner.setlk(
+            PathNodeRef {
+                path: p.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            owner,
+            lock,
+            sleep,
+            caller,
+        )
     }
     fn flock(
         &self,
-        node: &PathNode,
+        node: &PathNode<P::NodeState>,
         handle: &P::Handle,
         operation: i32,
         caller: &Caller,
     ) -> Result<(), Errno> {
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
-        self.inner.flock(p.as_deref(), handle, operation, caller)
+        self.inner.flock(
+            PathNodeRef {
+                path: p.as_deref(),
+                state: &node.state,
+            },
+            handle,
+            operation,
+            caller,
+        )
     }
 }
 
 impl<P: PathFilesystem> PathNodeFs<P> {
     fn remove_entry(
         &self,
-        cx: &Cx<'_, PathNode>,
+        cx: &Cx<'_, PathNode<P::NodeState>>,
         parent: NodeId,
         name: &OsStr,
         caller: &Caller,
         directory: bool,
     ) -> Result<(), Errno> {
         let _guard = write_lock(&self.operations);
+        let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         let parent_path = self.path(parent)?;
         if directory {
-            self.inner.rmdir(&parent_path, name, caller)?;
+            self.inner.rmdir(
+                PathNodeRef {
+                    path: Some(&parent_path),
+                    state: &parent_node.state,
+                },
+                name,
+                caller,
+            )?;
         } else {
-            self.inner.unlink(&parent_path, name, caller)?;
+            self.inner.unlink(
+                PathNodeRef {
+                    path: Some(&parent_path),
+                    state: &parent_node.state,
+                },
+                name,
+                caller,
+            )?;
         }
         let dentry = Dentry {
             parent,
@@ -1257,9 +1643,9 @@ impl<P: PathFilesystem> PathNodeFs<P> {
     }
 }
 
-struct BasicSink<'a, 'b, P> {
+struct BasicSink<'a, 'b, P: PathFilesystem> {
     owner: &'a PathNodeFs<P>,
-    cx: &'a Cx<'b, PathNode>,
+    cx: &'a Cx<'b, PathNode<P::NodeState>>,
     this: NodeId,
     parent: NodeId,
     output: &'a mut dyn DirSink,
@@ -1273,23 +1659,27 @@ impl<P: PathFilesystem> BasicSink<'_, '_, P> {
         }
     }
 }
-impl<P: PathFilesystem> PathDirSink for BasicSink<'_, '_, P> {
-    fn add(&mut self, name: &OsStr, kind: FileKind, next_offset: u64) -> bool {
-        let (id, inserted) = if name == OsStr::new(".") {
-            (self.this, None)
-        } else if name == OsStr::new("..") {
-            (self.parent, None)
-        } else {
-            match self
+impl<P: PathFilesystem> PathDirSink<P::NodeState> for BasicSink<'_, '_, P> {
+    fn add(
+        &mut self,
+        name: &OsStr,
+        kind: FileKind,
+        identity: PathDirIdentity<P::NodeState>,
+        next_offset: u64,
+    ) -> bool {
+        let (id, inserted) = match identity {
+            PathDirIdentity::Current => (self.this, None),
+            PathDirIdentity::Parent => (self.parent, None),
+            PathDirIdentity::Child(state) => match self
                 .owner
-                .add_enumerated_node(self.cx, self.this, name, kind)
+                .add_enumerated_node(self.cx, self.this, name, state)
             {
                 Ok(node) => node,
                 Err(error) => {
                     self.error = Some(error);
                     return false;
                 }
-            }
+            },
         };
         let accepted = self.output.add(name, id, kind, next_offset);
         if let Some(dentry) = inserted {
@@ -1302,9 +1692,9 @@ impl<P: PathFilesystem> PathDirSink for BasicSink<'_, '_, P> {
         accepted
     }
 }
-struct PlusSink<'a, 'b, P> {
+struct PlusSink<'a, 'b, P: PathFilesystem> {
     owner: &'a PathNodeFs<P>,
-    cx: &'a Cx<'b, PathNode>,
+    cx: &'a Cx<'b, PathNode<P::NodeState>>,
     this: NodeId,
     parent: NodeId,
     output: &'a mut dyn PlusDirSink,
@@ -1318,23 +1708,27 @@ impl<P: PathFilesystem> PlusSink<'_, '_, P> {
         }
     }
 }
-impl<P: PathFilesystem> PathPlusDirSink for PlusSink<'_, '_, P> {
-    fn add(&mut self, name: &OsStr, attr: NodeAttr, next_offset: u64) -> bool {
-        let (id, inserted) = if name == OsStr::new(".") {
-            (self.this, None)
-        } else if name == OsStr::new("..") {
-            (self.parent, None)
-        } else {
-            match self
+impl<P: PathFilesystem> PathPlusDirSink<P::NodeState> for PlusSink<'_, '_, P> {
+    fn add(
+        &mut self,
+        name: &OsStr,
+        attr: NodeAttr,
+        identity: PathDirIdentity<P::NodeState>,
+        next_offset: u64,
+    ) -> bool {
+        let (id, inserted) = match identity {
+            PathDirIdentity::Current => (self.this, None),
+            PathDirIdentity::Parent => (self.parent, None),
+            PathDirIdentity::Child(state) => match self
                 .owner
-                .add_enumerated_node(self.cx, self.this, name, attr.kind)
+                .add_enumerated_node(self.cx, self.this, name, state)
             {
                 Ok(node) => node,
                 Err(error) => {
                     self.error = Some(error);
                     return false;
                 }
-            }
+            },
         };
         let accepted = self.output.add(name, id, attr, next_offset);
         if let Some(dentry) = inserted {
@@ -1400,41 +1794,57 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingFs {
         getattr_paths: Arc<Mutex<Vec<Option<PathBuf>>>>,
+        getattr_states: Arc<Mutex<Vec<Arc<usize>>>>,
         forgotten_paths: Arc<Mutex<Vec<Option<PathBuf>>>>,
+        next_state: Arc<std::sync::atomic::AtomicUsize>,
+        alternate_dir_identity: bool,
     }
 
     impl PathFilesystem for RecordingFs {
+        type NodeState = usize;
         type Handle = ();
         type DirHandle = ();
 
+        fn root_state(&mut self) -> Arc<Self::NodeState> {
+            Arc::new(0)
+        }
+
         fn lookup(
             &self,
-            _parent: &Path,
+            _parent: PathNodeRef<'_, Self::NodeState>,
             _name: &OsStr,
             _caller: &Caller,
-        ) -> Result<Option<NodeAttr>, Errno> {
-            Ok(Some(NodeAttr::default()))
+        ) -> Result<Option<PathEntry<Self::NodeState>>, Errno> {
+            Ok(Some(PathEntry::new(
+                NodeAttr::default(),
+                Arc::new(
+                    self.next_state
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1,
+                ),
+            )))
         }
 
         fn getattr(
             &self,
-            path: Option<&Path>,
+            node: PathNodeRef<'_, Self::NodeState>,
             _handle: Option<&Self::Handle>,
             _caller: &Caller,
         ) -> Result<NodeAttr, Errno> {
-            mutex(&self.getattr_paths).push(path.map(Path::to_path_buf));
+            mutex(&self.getattr_paths).push(node.path().map(Path::to_path_buf));
+            mutex(&self.getattr_states).push(node.state_arc());
             Ok(NodeAttr::default())
         }
 
-        fn forget(&self, path: Option<&Path>) {
-            mutex(&self.forgotten_paths).push(path.map(Path::to_path_buf));
+        fn forget(&self, node: PathNodeRef<'_, Self::NodeState>) {
+            mutex(&self.forgotten_paths).push(node.path().map(Path::to_path_buf));
         }
 
         fn rename(
             &self,
-            _parent: &Path,
+            _parent: PathNodeRef<'_, Self::NodeState>,
             _name: &OsStr,
-            _newparent: &Path,
+            _newparent: PathNodeRef<'_, Self::NodeState>,
             _newname: &OsStr,
             _caller: &Caller,
         ) -> Result<(), Errno> {
@@ -1443,21 +1853,26 @@ mod tests {
 
         fn link(
             &self,
-            _path: &Path,
-            _newparent: &Path,
+            _node: PathNodeRef<'_, Self::NodeState>,
+            _newparent: PathNodeRef<'_, Self::NodeState>,
             _newname: &OsStr,
             _caller: &Caller,
         ) -> Result<NodeAttr, Errno> {
             Ok(NodeAttr::default())
         }
 
-        fn unlink(&self, _parent: &Path, _name: &OsStr, _caller: &Caller) -> Result<(), Errno> {
+        fn unlink(
+            &self,
+            _parent: PathNodeRef<'_, Self::NodeState>,
+            _name: &OsStr,
+            _caller: &Caller,
+        ) -> Result<(), Errno> {
             Ok(())
         }
 
         fn open(
             &self,
-            _path: &Path,
+            _node: PathNodeRef<'_, Self::NodeState>,
             _flags: i32,
             _caller: &Caller,
         ) -> Result<Opened<Self::Handle>, Errno> {
@@ -1466,7 +1881,7 @@ mod tests {
 
         fn opendir(
             &self,
-            _path: &Path,
+            _node: PathNodeRef<'_, Self::NodeState>,
             _flags: i32,
             _caller: &Caller,
         ) -> Result<Opened<Self::DirHandle>, Errno> {
@@ -1475,13 +1890,27 @@ mod tests {
 
         fn readdir(
             &self,
-            _path: &Path,
+            _node: PathNodeRef<'_, Self::NodeState>,
             _handle: &Self::DirHandle,
             _offset: u64,
-            sink: &mut dyn PathDirSink,
+            sink: &mut dyn PathDirSink<Self::NodeState>,
             _caller: &Caller,
         ) -> Result<(), Errno> {
-            assert!(sink.add(OsStr::new("enumerated"), FileKind::RegularFile, 1));
+            assert!(sink.add(
+                OsStr::new("enumerated"),
+                FileKind::RegularFile,
+                PathDirIdentity::Child(Arc::new(1)),
+                1,
+            ));
+            if self.alternate_dir_identity {
+                assert!(sink.add(
+                    OsStr::new("self"),
+                    FileKind::Directory,
+                    PathDirIdentity::Current,
+                    2,
+                ));
+                return Ok(());
+            }
             Err(Errno::EIO)
         }
     }
@@ -1639,6 +2068,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn typed_node_state_is_retained_across_aliases_and_unlink() {
+        let recording = RecordingFs::default();
+        let states = Arc::clone(&recording.getattr_states);
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+
+        runtime.getattr(1, None, &caller).unwrap();
+        assert_eq!(**mutex(&states).last().unwrap(), 0);
+
+        let node = found(runtime.lookup(1, OsStr::new("file"), &caller).unwrap());
+        runtime.getattr(node, None, &caller).unwrap();
+        let original = mutex(&states).last().unwrap().clone();
+        assert_eq!(*original, 1);
+
+        runtime.link(node, 1, OsStr::new("alias"), &caller).unwrap();
+        runtime
+            .rename(1, OsStr::new("alias"), 1, OsStr::new("renamed"), 0, &caller)
+            .unwrap();
+        runtime.getattr(node, None, &caller).unwrap();
+        assert!(Arc::ptr_eq(&original, mutex(&states).last().unwrap()));
+
+        let open = runtime.open(node, 0, &caller).unwrap();
+        runtime.unlink(1, OsStr::new("file"), &caller).unwrap();
+        runtime.unlink(1, OsStr::new("renamed"), &caller).unwrap();
+        runtime.getattr(node, Some(open.fh), &caller).unwrap();
+        assert!(Arc::ptr_eq(&original, mutex(&states).last().unwrap()));
+    }
+
     struct AcceptingSink;
     impl DirSink for AcceptingSink {
         fn add(&mut self, _name: &OsStr, _id: NodeId, _kind: FileKind, _next_offset: u64) -> bool {
@@ -1664,14 +2122,38 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn current_directory_identity_accepts_a_nonstandard_name() {
+        let runtime = Runtime::new(PathNodeFs::new(RecordingFs {
+            alternate_dir_identity: true,
+            ..Default::default()
+        }));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        assert_eq!(
+            runtime.readdir(1, open.fh, 0, &mut AcceptingSink, &caller),
+            Ok(())
+        );
+        assert!(matches!(
+            runtime.lookup(1, OsStr::new("enumerated"), &caller),
+            Ok(LookupReply::Found(_))
+        ));
+    }
+
     #[derive(Default)]
     struct RecordingDirSink {
         seen: Vec<(OsString, u64)>,
         stop_after: Option<usize>,
     }
 
-    impl PathDirSink for RecordingDirSink {
-        fn add(&mut self, name: &OsStr, _kind: FileKind, next_offset: u64) -> bool {
+    impl PathDirSink<()> for RecordingDirSink {
+        fn add(
+            &mut self,
+            name: &OsStr,
+            _kind: FileKind,
+            _identity: PathDirIdentity<()>,
+            next_offset: u64,
+        ) -> bool {
             self.seen.push((name.to_os_string(), next_offset));
             self.stop_after != Some(self.seen.len())
         }
@@ -1682,18 +2164,34 @@ mod tests {
         seen: Vec<(OsString, u64)>,
     }
 
-    impl PathPlusDirSink for RecordingPlusDirSink {
-        fn add(&mut self, name: &OsStr, _attr: NodeAttr, next_offset: u64) -> bool {
+    impl PathPlusDirSink<()> for RecordingPlusDirSink {
+        fn add(
+            &mut self,
+            name: &OsStr,
+            _attr: NodeAttr,
+            _identity: PathDirIdentity<()>,
+            next_offset: u64,
+        ) -> bool {
             self.seen.push((name.to_os_string(), next_offset));
             true
         }
     }
 
-    fn sample_dir_buffer() -> DirBuffer {
+    fn sample_dir_buffer() -> DirBuffer<()> {
         let mut buf = DirBuffer::new();
         buf.push_dots(NodeAttr::default(), NodeAttr::default());
-        buf.push("a", FileKind::RegularFile, NodeAttr::default());
-        buf.push("b", FileKind::RegularFile, NodeAttr::default());
+        buf.push(
+            "a",
+            FileKind::RegularFile,
+            NodeAttr::default(),
+            Arc::new(()),
+        );
+        buf.push(
+            "b",
+            FileKind::RegularFile,
+            NodeAttr::default(),
+            Arc::new(()),
+        );
         buf
     }
 
