@@ -6,11 +6,14 @@ on:
       - main
     tags:
       - '*'
-  pull_request:
+  pull_request: [ "main" ]
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build-ubuntu-typed-fuse:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
