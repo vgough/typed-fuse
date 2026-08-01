@@ -188,6 +188,12 @@ pub struct PathNodeRef<'a, S> {
 }
 
 impl<'a, S> PathNodeRef<'a, S> {
+    /// Builds a node reference directly; intended for driving a
+    /// [`PathFilesystem`] in tests without a mounted session.
+    pub fn new(path: Option<&'a Path>, state: &'a Arc<S>) -> Self {
+        Self { path, state }
+    }
+
     pub fn path(&self) -> Option<&'a Path> {
         self.path
     }
