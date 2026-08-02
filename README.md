@@ -7,6 +7,9 @@ This repository is a workspace containing the following crates:
 * **[`typed-fuse-core`](typed-fuse-core/)**: A backend-neutral, node-tracking core for building FUSE filesystems.
 * **[`libfuse-sys`](libfuse-sys/)**: Raw FFI bindings to libfuse. 
 
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the end-to-end request flow, API contracts,
+node and handle lifetime rules, path adapter design, and contributor-oriented code map.
+
 ## Acknowledgments
 
 This project started as a fork of the excellent [libfuse-sys](https://github.com/richard-w/libfuse-sys) crate by Richard Wiedenhöft, before expanding to include higher-level, safe abstractions for building filesystems. The raw FFI bindings remain in the `libfuse-sys` sub-crate.
