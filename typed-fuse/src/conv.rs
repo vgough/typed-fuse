@@ -16,7 +16,9 @@ use libfuse_sys::fuse_lowlevel::{
     FUSE_SET_ATTR_UID,
 };
 #[cfg(target_os = "macos")]
-use libfuse_sys::fuse_lowlevel::{statfs, timespec, FUSE_SET_ATTR_BTIME, FUSE_SET_ATTR_CTIME};
+use libc::statvfs;
+#[cfg(target_os = "macos")]
+use libfuse_sys::fuse_lowlevel::{timespec, FUSE_SET_ATTR_BTIME, FUSE_SET_ATTR_CTIME};
 #[cfg(not(target_os = "macos"))]
 use libfuse_sys::fuse_lowlevel::{statvfs, FUSE_SET_ATTR_CTIME};
 
@@ -249,24 +251,11 @@ pub(crate) fn setattr_from_raw(attr: *const stat, to_set: c_int) -> SetAttr {
     out
 }
 
-/// Converts to the raw type expected by `fuse_reply_statfs` on this
-/// platform (`statfs` on macOS, `statvfs` on Linux).
-#[cfg(target_os = "macos")]
-pub(crate) fn statfs_to_raw(s: &StatFs) -> statfs {
-    let mut out: statfs = unsafe { std::mem::zeroed() };
-    out.f_bsize = s.bsize;
-    out.f_blocks = s.blocks;
-    out.f_bfree = s.bfree;
-    out.f_bavail = s.bavail;
-    out.f_files = s.files;
-    out.f_ffree = s.ffree;
-    // macOS's `statfs` has no filename-length-limit field; `f_iosize`
-    // (preferred I/O size) is the closest analog to `frsize`.
-    out.f_iosize = s.frsize as i32;
-    out
-}
-
-#[cfg(not(target_os = "macos"))]
+/// Converts to the raw `statvfs` expected by `fuse_reply_statfs`. On macOS
+/// this is the vanilla (non-`$DARWIN`) symbol's parameter type — only the
+/// `$DARWIN` alias takes a `struct statfs` — and the bindings never see
+/// `statvfs`, hence `libc`'s. Note macOS's `fsblkcnt_t` is 32-bit, so the
+/// block/file counts truncate there.
 pub(crate) fn statfs_to_raw(s: &StatFs) -> statvfs {
     let mut out: statvfs = unsafe { std::mem::zeroed() };
     out.f_bsize = s.bsize as _;
@@ -382,7 +371,6 @@ mod tests {
         assert_eq!(attrs.ctime, None);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn statfs_conversion_spot_check() {
         let sfs = StatFs {
@@ -393,7 +381,7 @@ mod tests {
             ffree: 50,
             bsize: 4096,
             namelen: 255,
-            frsize: 4096,
+            frsize: 2048,
         };
         let raw = statfs_to_raw(&sfs);
         assert_eq!(raw.f_blocks, 1000);
@@ -402,5 +390,7 @@ mod tests {
         assert_eq!(raw.f_files, 100);
         assert_eq!(raw.f_ffree, 50);
         assert_eq!(raw.f_bsize, 4096);
+        assert_eq!(raw.f_frsize, 2048);
+        assert_eq!(raw.f_namemax, 255);
     }
 }

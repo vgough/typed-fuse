@@ -63,7 +63,9 @@ use libfuse_sys::fuse_lowlevel::{
 };
 
 #[cfg(target_os = "macos")]
-use libfuse_sys::fuse_lowlevel::{fuse_darwin_attr, statfs};
+use libc::statvfs;
+#[cfg(target_os = "macos")]
+use libfuse_sys::fuse_lowlevel::fuse_darwin_attr;
 #[cfg(not(target_os = "macos"))]
 use libfuse_sys::fuse_lowlevel::{
     fuse_reply_attr, fuse_reply_create, fuse_reply_entry, fuse_reply_statfs, statvfs,
@@ -124,7 +126,7 @@ fn raw_reply_create(
 }
 
 #[cfg(target_os = "macos")]
-fn raw_reply_statfs(req: fuse_req_t, stbuf: *const statfs) -> c_int {
+fn raw_reply_statfs(req: fuse_req_t, stbuf: *const statvfs) -> c_int {
     unsafe { fuse_reply_statfs_vanilla(req, stbuf) }
 }
 #[cfg(not(target_os = "macos"))]
