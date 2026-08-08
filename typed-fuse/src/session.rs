@@ -823,13 +823,15 @@ fn lock_from_raw(raw: &flock) -> Result<FileLock, Errno> {
 
 fn lock_to_raw(lock: FileLock) -> Result<flock, Errno> {
     let owned = file_lock::to_flock(lock)?;
-    Ok(flock {
-        l_start: owned.l_start,
-        l_len: owned.l_len,
-        l_pid: owned.l_pid,
-        l_type: owned.l_type,
-        l_whence: owned.l_whence,
-    })
+    // Same reason as file_lock::to_flock, and the same shape as
+    // lock_from_raw above: the bindgen flock has an extra l_sysid on FreeBSD.
+    let mut raw: flock = unsafe { std::mem::zeroed() };
+    raw.l_start = owned.l_start;
+    raw.l_len = owned.l_len;
+    raw.l_pid = owned.l_pid;
+    raw.l_type = owned.l_type;
+    raw.l_whence = owned.l_whence;
+    Ok(raw)
 }
 
 unsafe extern "C" fn getlk_shim<F: NodeFs>(
