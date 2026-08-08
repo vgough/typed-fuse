@@ -2,10 +2,12 @@
 //! directory tree: attribute conversions from `std::fs::Metadata`, no-follow
 //! extended-attribute syscalls, and POSIX permission checks.
 //!
-//! Everything here is platform portable across Linux and macOS (and FreeBSD);
+//! Everything here is platform portable across Linux, macOS and FreeBSD;
 //! per-OS differences in the xattr syscalls are hidden behind the
 //! [`setxattr_nofollow`], [`getxattr_nofollow`], [`listxattr_nofollow`], and
-//! [`removexattr_nofollow`] wrappers, which never follow symlinks.
+//! [`removexattr_nofollow`] wrappers, which never follow symlinks. Linux uses
+//! the `l*xattr` syscalls, macOS the `*xattr` ones with `XATTR_NOFOLLOW`, and
+//! FreeBSD the `extattr_*_link` family; see [`freebsd_xattr`] for the last.
 
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::Metadata;
@@ -137,43 +139,312 @@ pub fn statfs_path(path: &Path) -> Result<StatFs, Errno> {
 // No-follow extended attribute syscalls
 // ---------------------------------------------------------------------------
 
+/// Extended attributes on FreeBSD.
+///
+/// FreeBSD has no `l*xattr` syscalls. Extended attributes are reached through
+/// `extattr_*_link(2)`, which differs from the Linux API in three ways:
+///
+/// * The namespace is a separate argument rather than a prefix on the name,
+///   so `user.foo` becomes `(EXTATTR_NAMESPACE_USER, "foo")`. A name with no
+///   known prefix is rejected rather than silently aliased onto the user
+///   namespace: Linux rejects those too, with ENOTSUP, "The namespace prefix
+///   of name is not valid" (setxattr(2)).
+/// * `extattr_list_link` returns "a single byte containing the length of the
+///   attribute name, followed by the attribute name ... not terminated by
+///   ASCII 0 (nul)" (extattr(2)), while callers here expect NUL-terminated
+///   names, so the list is re-encoded and the prefix put back.
+/// * `extattr_set_link` has no flags argument, so `XATTR_CREATE` and
+///   `XATTR_REPLACE` are emulated with a preceding existence probe. That
+///   probe is not atomic; FreeBSD offers no atomic equivalent.
+#[cfg(target_os = "freebsd")]
+pub mod freebsd_xattr {
+    use std::ffi::{CStr, CString};
+
+    use typed_fuse_core::Errno;
+
+    // The FUSE protocol carries the Linux values, which FreeBSD's libc does
+    // not define. From linux/include/uapi/linux/xattr.h:
+    //   #define XATTR_CREATE  0x1  /* set value, fail if attr already exists */
+    //   #define XATTR_REPLACE 0x2  /* set value, fail if attr does not exist */
+    const XATTR_CREATE: libc::c_int = 0x1;
+    const XATTR_REPLACE: libc::c_int = 0x2;
+
+    // Same header: XATTR_USER_PREFIX "user.", XATTR_SYSTEM_PREFIX "system.".
+    const USER_PREFIX: &[u8] = b"user.";
+    const SYSTEM_PREFIX: &[u8] = b"system.";
+
+    /// Split a Linux-style namespaced attribute name into the FreeBSD
+    /// namespace id and the bare name.
+    ///
+    /// Returns `EOPNOTSUPP` for a name in no known namespace, matching what
+    /// Linux does with the same input.
+    pub fn split_namespace(name: &[u8]) -> Result<(libc::c_int, CString), Errno> {
+        let (namespace, bare) = if let Some(rest) = name.strip_prefix(USER_PREFIX) {
+            (libc::EXTATTR_NAMESPACE_USER, rest)
+        } else if let Some(rest) = name.strip_prefix(SYSTEM_PREFIX) {
+            (libc::EXTATTR_NAMESPACE_SYSTEM, rest)
+        } else {
+            return Err(Errno::EOPNOTSUPP);
+        };
+        // An empty bare name is not an attribute, and CString::new would
+        // happily build one.
+        if bare.is_empty() {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        Ok((namespace, CString::new(bare).map_err(|_| Errno::EINVAL)?))
+    }
+
+    /// True when the attribute is present. Used only to emulate the
+    /// create/replace flags, so a failure to look it up reads as absent.
+    fn exists(path: &CStr, namespace: libc::c_int, bare: &CStr) -> bool {
+        // extattr(2): a NULL data pointer returns the size instead of copying.
+        let ret = unsafe {
+            libc::extattr_get_link(
+                path.as_ptr(),
+                namespace,
+                bare.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        ret >= 0
+    }
+
+    /// `extattr_set_link`, with the Linux create/replace flags emulated.
+    pub fn setxattr(
+        path: &CStr,
+        name: &CStr,
+        value: &[u8],
+        flags: libc::c_int,
+    ) -> Result<(), Errno> {
+        let (namespace, bare) = split_namespace(name.to_bytes())?;
+        if flags & (XATTR_CREATE | XATTR_REPLACE) != 0 {
+            let present = exists(path, namespace, &bare);
+            if flags & XATTR_CREATE != 0 && present {
+                return Err(Errno::EEXIST);
+            }
+            if flags & XATTR_REPLACE != 0 && !present {
+                return Err(Errno::ENODATA);
+            }
+        }
+        let ret = unsafe {
+            libc::extattr_set_link(
+                path.as_ptr(),
+                namespace,
+                bare.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+            )
+        };
+        // Unlike lsetxattr, this returns the number of bytes written.
+        if ret < 0 {
+            Err(std::io::Error::last_os_error().into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `extattr_get_link`. An empty `buf` probes the size.
+    pub fn getxattr(path: &CStr, name: &CStr, buf: &mut [u8]) -> Result<usize, Errno> {
+        let (namespace, bare) = split_namespace(name.to_bytes())?;
+        let (ptr, size) = if buf.is_empty() {
+            (std::ptr::null_mut(), 0)
+        } else {
+            (buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        let ret = unsafe {
+            libc::extattr_get_link(path.as_ptr(), namespace, bare.as_ptr(), ptr, size)
+        };
+        if ret < 0 {
+            Err(std::io::Error::last_os_error().into())
+        } else {
+            Ok(ret as usize)
+        }
+    }
+
+    /// `extattr_delete_link`.
+    pub fn removexattr(path: &CStr, name: &CStr) -> Result<(), Errno> {
+        let (namespace, bare) = split_namespace(name.to_bytes())?;
+        let ret =
+            unsafe { libc::extattr_delete_link(path.as_ptr(), namespace, bare.as_ptr()) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().into())
+        }
+    }
+
+    /// Re-encode one `extattr_list_link` buffer into NUL-terminated names
+    /// carrying `prefix`.
+    ///
+    /// The input is a run of `[len][name]` entries with no terminators. A
+    /// trailing entry that runs past the end means the buffer was cut short,
+    /// which extattr(2) does not define a behaviour for, so it is reported
+    /// rather than guessed at.
+    fn decode_list(raw: &[u8], prefix: &[u8], out: &mut Vec<u8>) -> Result<(), Errno> {
+        let mut i = 0;
+        while i < raw.len() {
+            let len = raw[i] as usize;
+            i += 1;
+            let end = i.checked_add(len).ok_or(Errno::EIO)?;
+            if end > raw.len() {
+                return Err(Errno::EIO);
+            }
+            out.extend_from_slice(prefix);
+            out.extend_from_slice(&raw[i..end]);
+            out.push(0);
+            i = end;
+        }
+        Ok(())
+    }
+
+    /// Read one namespace's list and append it to `out`, prefixed.
+    fn append_namespace(path: &CStr, namespace: libc::c_int, prefix: &[u8], out: &mut Vec<u8>)
+        -> Result<(), Errno> {
+        let size = unsafe {
+            libc::extattr_list_link(path.as_ptr(), namespace, std::ptr::null_mut(), 0)
+        };
+        if size < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if size == 0 {
+            return Ok(());
+        }
+        let mut raw = vec![0u8; size as usize];
+        let len = unsafe {
+            libc::extattr_list_link(
+                path.as_ptr(),
+                namespace,
+                raw.as_mut_ptr() as *mut libc::c_void,
+                raw.len(),
+            )
+        };
+        if len < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // The list can shrink between the sizing call and this one.
+        raw.truncate(len as usize);
+        decode_list(&raw, prefix, out)
+    }
+
+    /// `extattr_list_link`, re-encoded as the NUL-terminated list the callers
+    /// here expect. An empty `buf` probes the size of that encoding, which is
+    /// not the size `extattr_list_link` reports.
+    ///
+    /// Only the user namespace is listed. `extattr_list_link` takes one
+    /// namespace per call, and the system namespace is privileged, so
+    /// enumerating it would fail for the unprivileged callers a passthrough
+    /// filesystem serves. Named attributes in it stay reachable through
+    /// get/set/remove.
+    pub fn listxattr(path: &CStr, buf: &mut [libc::c_char]) -> Result<usize, Errno> {
+        let mut names = Vec::new();
+        append_namespace(path, libc::EXTATTR_NAMESPACE_USER, USER_PREFIX, &mut names)?;
+        if buf.is_empty() {
+            return Ok(names.len());
+        }
+        if buf.len() < names.len() {
+            return Err(Errno::ERANGE);
+        }
+        for (slot, byte) in buf.iter_mut().zip(names.iter()) {
+            *slot = *byte as libc::c_char;
+        }
+        Ok(names.len())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn splits_known_namespaces() {
+            let (ns, bare) = split_namespace(b"user.encfs.abc").unwrap();
+            assert_eq!(ns, libc::EXTATTR_NAMESPACE_USER);
+            assert_eq!(bare.to_bytes(), b"encfs.abc");
+
+            let (ns, bare) = split_namespace(b"system.acl").unwrap();
+            assert_eq!(ns, libc::EXTATTR_NAMESPACE_SYSTEM);
+            assert_eq!(bare.to_bytes(), b"acl");
+        }
+
+        #[test]
+        fn rejects_unknown_and_empty_namespaces() {
+            // Linux answers ENOTSUP here too, so "user.x" and a bare "x"
+            // cannot collide on the same stored attribute.
+            assert_eq!(split_namespace(b"bare"), Err(Errno::EOPNOTSUPP));
+            assert_eq!(split_namespace(b"trusted.x"), Err(Errno::EOPNOTSUPP));
+            assert_eq!(split_namespace(b"user."), Err(Errno::EOPNOTSUPP));
+        }
+
+        #[test]
+        fn decodes_length_prefixed_list() {
+            // Two entries: "ab" and "cde".
+            let raw = [2u8, b'a', b'b', 3, b'c', b'd', b'e'];
+            let mut out = Vec::new();
+            decode_list(&raw, USER_PREFIX, &mut out).unwrap();
+            assert_eq!(out, b"user.ab\0user.cde\0");
+        }
+
+        #[test]
+        fn decodes_empty_list() {
+            let mut out = Vec::new();
+            decode_list(&[], USER_PREFIX, &mut out).unwrap();
+            assert!(out.is_empty());
+        }
+
+        #[test]
+        fn rejects_a_truncated_entry() {
+            // Claims 9 bytes but supplies 2.
+            let raw = [9u8, b'a', b'b'];
+            let mut out = Vec::new();
+            assert_eq!(decode_list(&raw, USER_PREFIX, &mut out), Err(Errno::EIO));
+        }
+    }
+}
+
 /// Set an extended attribute without following symlinks.
 ///
-/// On Linux/FreeBSD this is `lsetxattr`; on macOS it is `setxattr` with
-/// `XATTR_NOFOLLOW`.
+/// On Linux this is `lsetxattr`, on macOS `setxattr` with `XATTR_NOFOLLOW`,
+/// and on FreeBSD `extattr_set_link` (see [`freebsd_xattr`]).
 pub fn setxattr_nofollow(
     path: &CStr,
     name: &CStr,
     value: &[u8],
     flags: libc::c_int,
 ) -> Result<(), Errno> {
-    let ret = unsafe {
-        #[cfg(target_os = "macos")]
-        {
-            libc::setxattr(
-                path.as_ptr(),
-                name.as_ptr(),
-                value.as_ptr() as *const libc::c_void,
-                value.len(),
-                0,
-                flags | libc::XATTR_NOFOLLOW,
-            )
+    #[cfg(target_os = "freebsd")]
+    {
+        freebsd_xattr::setxattr(path, name, value, flags)
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let ret = unsafe {
+            #[cfg(target_os = "macos")]
+            {
+                libc::setxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_ptr() as *const libc::c_void,
+                    value.len(),
+                    0,
+                    flags | libc::XATTR_NOFOLLOW,
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                libc::lsetxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_ptr() as *const libc::c_void,
+                    value.len(),
+                    flags,
+                )
+            }
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().into())
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            libc::lsetxattr(
-                path.as_ptr(),
-                name.as_ptr(),
-                value.as_ptr() as *const libc::c_void,
-                value.len(),
-                flags,
-            )
-        }
-    };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().into())
     }
 }
 
@@ -182,32 +453,39 @@ pub fn setxattr_nofollow(
 /// Pass an empty slice for `buf` to probe the value length. Returns the
 /// number of bytes stored (or that would be stored when probing).
 pub fn getxattr_nofollow(path: &CStr, name: &CStr, buf: &mut [u8]) -> Result<usize, Errno> {
-    let (ptr, size) = if buf.is_empty() {
-        (std::ptr::null_mut(), 0)
-    } else {
-        (buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-    };
-    let ret = unsafe {
-        #[cfg(target_os = "macos")]
-        {
-            libc::getxattr(
-                path.as_ptr(),
-                name.as_ptr(),
-                ptr,
-                size,
-                0,
-                libc::XATTR_NOFOLLOW,
-            )
+    #[cfg(target_os = "freebsd")]
+    {
+        freebsd_xattr::getxattr(path, name, buf)
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let (ptr, size) = if buf.is_empty() {
+            (std::ptr::null_mut(), 0)
+        } else {
+            (buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        let ret = unsafe {
+            #[cfg(target_os = "macos")]
+            {
+                libc::getxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    ptr,
+                    size,
+                    0,
+                    libc::XATTR_NOFOLLOW,
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                libc::lgetxattr(path.as_ptr(), name.as_ptr(), ptr, size)
+            }
+        };
+        if ret < 0 {
+            Err(std::io::Error::last_os_error().into())
+        } else {
+            Ok(ret as usize)
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            libc::lgetxattr(path.as_ptr(), name.as_ptr(), ptr, size)
-        }
-    };
-    if ret < 0 {
-        Err(std::io::Error::last_os_error().into())
-    } else {
-        Ok(ret as usize)
     }
 }
 
@@ -226,25 +504,32 @@ pub fn getxattr_value_nofollow(path: &CStr, name: &CStr) -> Result<Vec<u8>, Errn
 /// number of bytes stored (or that would be stored when probing). The list
 /// is a sequence of NUL-terminated names.
 pub fn listxattr_nofollow(path: &CStr, buf: &mut [libc::c_char]) -> Result<usize, Errno> {
-    let (ptr, size) = if buf.is_empty() {
-        (std::ptr::null_mut(), 0)
-    } else {
-        (buf.as_mut_ptr(), buf.len())
-    };
-    let ret = unsafe {
-        #[cfg(target_os = "macos")]
-        {
-            libc::listxattr(path.as_ptr(), ptr, size, libc::XATTR_NOFOLLOW)
+    #[cfg(target_os = "freebsd")]
+    {
+        freebsd_xattr::listxattr(path, buf)
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let (ptr, size) = if buf.is_empty() {
+            (std::ptr::null_mut(), 0)
+        } else {
+            (buf.as_mut_ptr(), buf.len())
+        };
+        let ret = unsafe {
+            #[cfg(target_os = "macos")]
+            {
+                libc::listxattr(path.as_ptr(), ptr, size, libc::XATTR_NOFOLLOW)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                libc::llistxattr(path.as_ptr(), ptr, size)
+            }
+        };
+        if ret < 0 {
+            Err(std::io::Error::last_os_error().into())
+        } else {
+            Ok(ret as usize)
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            libc::llistxattr(path.as_ptr(), ptr, size)
-        }
-    };
-    if ret < 0 {
-        Err(std::io::Error::last_os_error().into())
-    } else {
-        Ok(ret as usize)
     }
 }
 
@@ -264,20 +549,27 @@ pub fn listxattr_names_nofollow(path: &CStr) -> Result<Vec<Vec<u8>>, Errno> {
 
 /// Remove an extended attribute without following symlinks.
 pub fn removexattr_nofollow(path: &CStr, name: &CStr) -> Result<(), Errno> {
-    let ret = unsafe {
-        #[cfg(target_os = "macos")]
-        {
-            libc::removexattr(path.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW)
+    #[cfg(target_os = "freebsd")]
+    {
+        freebsd_xattr::removexattr(path, name)
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let ret = unsafe {
+            #[cfg(target_os = "macos")]
+            {
+                libc::removexattr(path.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                libc::lremovexattr(path.as_ptr(), name.as_ptr())
+            }
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().into())
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            libc::lremovexattr(path.as_ptr(), name.as_ptr())
-        }
-    };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().into())
     }
 }
 
