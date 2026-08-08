@@ -54,7 +54,7 @@ use libfuse_sys::fuse_lowlevel::{
 // Which session constructor exists depends on the installed headers, not on
 // the OS. macFUSE has long shipped the ABI-versioned
 // `fuse_session_new_versioned()`; vanilla libfuse gained it too, and from
-// 3.16 spells `fuse_session_new()` as a macro over a `static inline` wrapper
+// 3.17 spells `fuse_session_new()` as a macro over a `static inline` wrapper
 // that bindgen does not emit. `has_session_new_versioned` is set by build.rs
 // when the headers declare the versioned form, so an older libfuse still
 // takes the plain path. macOS keeps its own branch: macFUSE's

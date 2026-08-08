@@ -37,7 +37,7 @@ fn main() {
     if header_contains(&fuse_lib, "fuse_lowlevel.h", "*statx)") {
         println!("cargo:rustc-cfg=has_statx_op");
     }
-    // Since libfuse 3.16, fuse_session_new() is a macro over a static inline
+    // Since libfuse 3.17, fuse_session_new() is a macro over a static inline
     // wrapper around fuse_session_new_versioned(). bindgen emits neither, so
     // the plain symbol is absent from the bindings against those headers.
     if header_contains(&fuse_lib, "fuse_lowlevel.h", "fuse_session_new_versioned") {
