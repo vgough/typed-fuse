@@ -18,7 +18,13 @@ impl Errno {
     pub const ENOTEMPTY: Errno = Errno(libc::ENOTEMPTY);
     pub const ERANGE: Errno = Errno(libc::ERANGE);
     /// "No data available" - used for missing extended attributes.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub const ENODATA: Errno = Errno(libc::ENODATA);
+    /// "No data available" - used for missing extended attributes.
+    /// FreeBSD and macOS have no ENODATA; ENOATTR is the equivalent there
+    /// (FreeBSD errno(2): "87 ENOATTR  Attribute not found").
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub const ENODATA: Errno = Errno(libc::ENOATTR);
     /// The error used for missing extended attributes.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub const ENOATTR: Errno = Errno(libc::ENODATA);
