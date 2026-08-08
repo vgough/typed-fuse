@@ -51,12 +51,18 @@ use libfuse_sys::fuse_lowlevel::{
     loop_cfg_set_idle_threads_312, loop_cfg_set_max_threads_312, session_loop_mt_312,
 };
 
-// macOS's macFUSE ships a patched libfuse with an ABI-versioned
-// `fuse_session_new_versioned()` (and the `libfuse_version` struct it
-// takes); vanilla Linux libfuse only has the plain `fuse_session_new()`.
-#[cfg(not(target_os = "macos"))]
+// Which session constructor exists depends on the installed headers, not on
+// the OS. macFUSE has long shipped the ABI-versioned
+// `fuse_session_new_versioned()`; vanilla libfuse gained it too, and from
+// 3.16 spells `fuse_session_new()` as a macro over a `static inline` wrapper
+// that bindgen does not emit. `has_session_new_versioned` is set by build.rs
+// when the headers declare the versioned form, so an older libfuse still
+// takes the plain path. macOS keeps its own branch: macFUSE's
+// `libfuse_version` carries a darwin-extensions bit where vanilla libfuse has
+// padding.
+#[cfg(not(any(target_os = "macos", has_session_new_versioned)))]
 use libfuse_sys::fuse_lowlevel::fuse_session_new;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", has_session_new_versioned))]
 use libfuse_sys::fuse_lowlevel::{
     FUSE_HOTFIX_VERSION, FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION, fuse_session_new_versioned,
     libfuse_version,
@@ -1262,7 +1268,25 @@ impl<F: NodeFs> Session<F> {
                 runtime as *mut c_void,
             )
         };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(not(target_os = "macos"), has_session_new_versioned))]
+        let session = unsafe {
+            // What the `static inline fuse_session_new_fn()` behind the
+            // `fuse_session_new` macro does, since bindgen cannot emit it.
+            let mut version = libfuse_version {
+                major: FUSE_MAJOR_VERSION as _,
+                minor: FUSE_MINOR_VERSION as _,
+                hotfix: FUSE_HOTFIX_VERSION as _,
+                ..Default::default()
+            };
+            fuse_session_new_versioned(
+                &mut args,
+                &ops,
+                std::mem::size_of::<fuse_lowlevel_ops>(),
+                &mut version,
+                runtime as *mut c_void,
+            )
+        };
+        #[cfg(not(any(target_os = "macos", has_session_new_versioned)))]
         let session = unsafe {
             fuse_session_new(
                 &mut args,
