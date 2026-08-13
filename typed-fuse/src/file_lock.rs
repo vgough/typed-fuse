@@ -59,13 +59,17 @@ pub fn to_flock(lock: FileLock) -> Result<libc::flock, Errno> {
         libc::off_t::try_from(length).map_err(|_| Errno::from_raw(libc::EOVERFLOW))?
     };
 
-    Ok(libc::flock {
-        l_type,
-        l_whence: SEEK_SET,
-        l_start,
-        l_len,
-        l_pid: libc::pid_t::try_from(pid).map_err(|_| Errno::from_raw(libc::EOVERFLOW))?,
-    })
+    // Zero first and assign the known fields, rather than a struct literal:
+    // FreeBSD's flock carries an extra l_sysid that Linux's does not, and a
+    // literal has to name every field. This mirrors lock_from_raw in
+    // session.rs. l_sysid = 0 is "the local system".
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = l_type;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = l_start;
+    lock.l_len = l_len;
+    lock.l_pid = libc::pid_t::try_from(pid).map_err(|_| Errno::from_raw(libc::EOVERFLOW))?;
+    Ok(lock)
 }
 
 /// Converts a `libc::flock` into a [`FileLock`].

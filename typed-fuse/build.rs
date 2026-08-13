@@ -1,8 +1,9 @@
 //! Probes the system libfuse headers for a handful of API additions that
 //! post-date the widely-packaged 3.14 release (`parallel_direct_writes`,
-//! the `tmpfile`/`statx` lowlevel ops). `libfuse-sys`'s bindgen output only
-//! exposes what the installed headers actually declare, so code here that
-//! calls into those symbols must be compiled out when they're absent.
+//! the `tmpfile`/`statx` lowlevel ops, the versioned session constructor).
+//! `libfuse-sys`'s bindgen output only exposes what the installed headers
+//! actually declare, so code here that calls into those symbols must be
+//! compiled out when they're absent.
 
 use std::fs;
 
@@ -25,6 +26,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_parallel_direct_writes)");
     println!("cargo:rustc-check-cfg=cfg(has_tmpfile_op)");
     println!("cargo:rustc-check-cfg=cfg(has_statx_op)");
+    println!("cargo:rustc-check-cfg=cfg(has_session_new_versioned)");
 
     if header_contains(&fuse_lib, "fuse_common.h", "parallel_direct_writes") {
         println!("cargo:rustc-cfg=has_parallel_direct_writes");
@@ -34,5 +36,11 @@ fn main() {
     }
     if header_contains(&fuse_lib, "fuse_lowlevel.h", "*statx)") {
         println!("cargo:rustc-cfg=has_statx_op");
+    }
+    // Since libfuse 3.17, fuse_session_new() is a macro over a static inline
+    // wrapper around fuse_session_new_versioned(). bindgen emits neither, so
+    // the plain symbol is absent from the bindings against those headers.
+    if header_contains(&fuse_lib, "fuse_lowlevel.h", "fuse_session_new_versioned") {
+        println!("cargo:rustc-cfg=has_session_new_versioned");
     }
 }
