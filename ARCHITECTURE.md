@@ -229,7 +229,13 @@ For both forms:
 - only emit live `NodeId`s.
 
 A directory-handle snapshot makes cookies stable when the namespace changes between calls. The
-path API's `DirBuffer` and the general `replay` helper encode the common `index + 1` cookie scheme.
+general `replay` helper encodes the common `index + 1` cookie scheme for `NodeFs` implementations.
+
+`NodeFs` owns this policy. In particular, a `NodeFs` implementation that snapshots a directory in
+`opendir` will keep replaying that snapshot after `rewinddir`. On FreeBSD, fusefs can also reuse one
+directory handle across multiple userspace `opendir` calls, especially for the root vnode, so such
+a snapshot can remain stale until unmount. Implementations that need POSIX refresh behavior should
+rebuild their snapshot whenever a read starts at offset zero.
 
 For `readdirplus`, the runtime increments lookup counts only after the underlying libfuse buffer
 accepts a non-dot entry. If the filesystem callback later returns an error, it rolls those
@@ -312,12 +318,47 @@ A path listing cannot supply a `NodeId` directly. Each entry supplies `PathDirId
 - `Child(Arc<NodeState>)` for a real child.
 
 This lets the adapter reuse the current/parent identities and create or deduplicate child runtime
-nodes. If a listing fails or the downstream buffer rejects a newly inserted child, the adapter
-rolls back the corresponding dentry and runtime link.
+nodes. If the downstream buffer rejects a newly inserted child, the adapter rolls back the
+corresponding dentry and runtime link.
 
-`DirBuffer<NodeState>` is a ready-made immutable directory snapshot. Build it in `opendir`, usually
-with `push_dots` followed by `push`, store it as `DirHandle`, and call `fill` or `fill_plus` from the
-listing callback. It provides stable `index + 1` offsets and stops when the sink is full.
+`PathFilesystem::opendir` performs access checks and creates only filesystem-owned per-open state.
+`PathFilesystem::list_dir` builds a `DirBuffer<NodeState>`, usually with `push_dots` followed by
+`push` (name and kind) or `push_plus` (name and attributes) per child. A basic `readdir` uses only
+the kind. A `readdirplus` sends `push_plus` attributes as listed and looks up each `push` entry to
+get them, skipping a name the lookup doesn't find. A lookup error on such an entry ends the reply
+before it, or fails the read if nothing was sent yet. The adapter owns the listing policy and
+resume cookies:
+
+- listing is lazy, so an opened directory that is never read has no enumeration cost;
+- an offset-zero read always calls `list_dir` and adds the successful result to the handle as its
+  current listing, under the next of 16 rotating generation numbers;
+- each cookie holds `index + 1` in its low 27 bits and the listing's generation in bits 27-30, so
+  cookies stay below 2^31 and a listing holds at most 2^27 - 1 entries (`EOVERFLOW` beyond that);
+- a nonzero read resumes the listing its cookie names. The handle keeps the four most recent
+  listings, so two streams interleaved on one handle (FreeBSD shares a handle between `opendir`
+  calls from the same process) each resume their own. If the named listing has been evicted, the
+  read resumes the current listing by index, and a handle that has never been read lists first;
+- `readdir` and `readdirplus` share the same listings;
+- a read that sends no entries ends the stream for the kernel, so the adapter drops the listing it
+  read and records where it ended. A repeated read at that point stays empty instead of listing
+  again; FreeBSD's `getdents` always makes one. A read that borrowed the current listing because
+  its own was evicted drops nothing, since that listing belongs to another stream; and
+- a failed refresh leaves the retained listings available for later resumed reads.
+
+Each directory node counts the namespace mutations routed through the adapter (`create`, `mknod`,
+`mkdir`, `symlink`, `link`, `unlink`, `rmdir`, and both sides of `rename`), and each listing records
+that count when it is taken. When a resumed read finds the count has moved, it looks every child up
+again before sending it: a name that is gone (`None` or `ENOENT`) is skipped rather than reported
+and re-inserted into the namespace, and a name that now refers to something else is sent with its
+current attributes and state. Attribute-only changes such as `write` and `setattr` don't count, so a resumed
+`readdirplus` page can still carry an older size or time. Changes made to the backing store outside
+the mount aren't detected.
+
+The handle mutex protects only cloning or replacing listing `Arc`s; backing I/O and sink filling
+run outside it. Each successful read is therefore internally consistent even when two offset-zero
+reads overlap. A listing read to its end is dropped by that final empty read. A handle retains
+up to four listings that were not read to the end, including each child's `Arc<NodeState>`, until
+`releasedir` (or unmount for a long-lived reused FreeBSD handle).
 
 For tests that call a `PathFilesystem` without the adapter, construct a `PathNodeRef` directly with
 `PathNodeRef::new`.
@@ -472,8 +513,8 @@ For a new filesystem:
    open/listing for the minimum mountable tree.
 4. Keep namespace links and `NodeAttr::nlink` consistent. For `NodeFs`, mirror identity changes in
    `Cx`; for the path API, return `PathEntry`/`PathDirIdentity` state consistently.
-5. Make directory offsets resumable and stop on a full sink. Snapshot mutable listings per open
-   when practical.
+5. For `NodeFs`, make directory offsets resumable and stop on a full sink. For `PathFilesystem`,
+   return a complete `DirBuffer` from `list_dir`; the adapter owns offsets and partial replies.
 6. Apply `SetAttr` field-by-field and implement the xattr size-probe protocol.
 7. Decide whether the kernel (`DefaultPermissions`) or the filesystem enforces access policy; do
    not accidentally rely on the default permissive `access` callback.
@@ -516,6 +557,8 @@ Run the examples against a real mount point with:
 mkdir -p /tmp/typed-fuse-mnt
 cargo run -p typed-fuse --example hello_ll -- /tmp/typed-fuse-mnt
 # or: cargo run -p typed-fuse --example memory_fs -- /tmp/typed-fuse-mnt
+# or, for the path adapter:
+cargo run -p typed-fuse --example path_passthrough -- /tmp/backing /tmp/typed-fuse-mnt
 ```
 
 Unmount with `fusermount3 -u` on Linux or `umount` on macOS. The mdtest-based filesystem benchmark

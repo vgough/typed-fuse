@@ -38,6 +38,7 @@ impl Errno {
     pub const ENAMETOOLONG: Errno = Errno(libc::ENAMETOOLONG);
     pub const ENXIO: Errno = Errno(libc::ENXIO);
     pub const EOPNOTSUPP: Errno = Errno(libc::EOPNOTSUPP);
+    pub const EOVERFLOW: Errno = Errno(libc::EOVERFLOW);
 
     /// Wraps a raw `errno` value.
     pub const fn from_raw(errno: i32) -> Self {

@@ -25,7 +25,12 @@ use typed_fuse_core::{Caller, Errno, FileKind, NodeAttr, StatFs};
 
 /// Map `std::fs::Metadata` file type to a FUSE [`FileKind`].
 pub fn file_type_from_metadata(metadata: &Metadata) -> FileKind {
-    let ft = metadata.file_type();
+    file_kind_from_file_type(metadata.file_type())
+}
+
+/// Map a [`std::fs::FileType`], such as one from
+/// [`std::fs::DirEntry::file_type`], to a FUSE [`FileKind`].
+pub fn file_kind_from_file_type(ft: std::fs::FileType) -> FileKind {
     if ft.is_dir() {
         FileKind::Directory
     } else if ft.is_symlink() {
