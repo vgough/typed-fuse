@@ -21,6 +21,15 @@ use typed_fuse::{
     TimeOrNow,
 };
 
+// FreeBSD's libc has no XATTR_* flags; the FUSE protocol carries the Linux
+// values (see `typed_fuse::passthrough::freebsd_xattr`).
+#[cfg(target_os = "freebsd")]
+const XATTR_CREATE: i32 = 0x1;
+#[cfg(target_os = "freebsd")]
+const XATTR_REPLACE: i32 = 0x2;
+#[cfg(not(target_os = "freebsd"))]
+use libc::{XATTR_CREATE, XATTR_REPLACE};
+
 #[derive(Clone, Copy)]
 struct DirEntry {
     id: NodeId,
@@ -683,10 +692,10 @@ impl NodeFs for MemoryFs {
     ) -> Result<(), Errno> {
         let mut node = node.write();
         let exists = node.xattrs.contains_key(name);
-        if flags & libc::XATTR_CREATE != 0 && exists {
+        if flags & XATTR_CREATE != 0 && exists {
             return Err(Errno::EEXIST);
         }
-        if flags & libc::XATTR_REPLACE != 0 && !exists {
+        if flags & XATTR_REPLACE != 0 && !exists {
             return Err(Errno::ENODATA);
         }
         node.xattrs.insert(name.to_os_string(), value.to_vec());
