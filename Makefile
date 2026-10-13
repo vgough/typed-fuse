@@ -1,7 +1,10 @@
-.PHONY: test hello_ll memory_fs run_memory_fs memory_fs_release benchmark benchmark-save-baseline clean
+.PHONY: test update-deps hello_ll memory_fs run_memory_fs memory_fs_release benchmark benchmark-save-baseline clean
 
 test:
 	cargo nextest run --workspace
+
+update-deps:
+	cargo update
 
 hello_ll:
 	cargo build -p libfuse-sys --example hello_ll_raw --features fuse_35
