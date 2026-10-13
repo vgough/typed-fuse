@@ -1,6 +1,6 @@
 [package]
 name = "typed-fuse"
-version = "0.6.0"
+version = "0.7.0"
 description = "High-level, safe Rust wrapper for building FUSE 3 filesystems"
 repository = "https://github.com/vgough/typed-fuse"
 authors = ["Valient Gough <vgough@arg0.net>"]
@@ -21,7 +21,6 @@ pkg-config = "0.3"
 
 [dev-dependencies]
 anyhow = "1"
-chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }

@@ -3,11 +3,21 @@ extern crate pkg_config;
 
 use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::iter;
 use std::path::PathBuf;
 use std::process::Command;
 
 const FUSE_DEFAULT_API_VERSION: u32 = 35;
+
+fn header_contains(fuse_lib: &pkg_config::Library, header: &str, needle: &str) -> bool {
+    fuse_lib
+        .include_paths
+        .iter()
+        .map(|dir| dir.join(header))
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .any(|contents| contents.contains(needle))
+}
 
 fn clang_resource_include_path() -> Option<PathBuf> {
     let clang = env::var_os("CLANG_PATH").unwrap_or_else(|| "clang".into());
@@ -193,6 +203,19 @@ fn main() {
 
     // FUSE 3.1 and later use the fuse3 pkg-config module.
     let fuse_lib = pkgcfg.cargo_metadata(true).probe("fuse3").unwrap();
+
+    // Since libfuse 3.17, fuse_main_real() and fuse_session_new() are static
+    // inline wrappers around ABI-versioned entry points. bindgen does not
+    // emit static inline functions, so callers must use the versioned forms
+    // when the headers declare them.
+    println!("cargo:rustc-check-cfg=cfg(has_main_real_versioned)");
+    println!("cargo:rustc-check-cfg=cfg(has_session_new_versioned)");
+    if header_contains(&fuse_lib, "fuse.h", "fuse_main_real_versioned") {
+        println!("cargo:rustc-cfg=has_main_real_versioned");
+    }
+    if header_contains(&fuse_lib, "fuse_lowlevel.h", "fuse_session_new_versioned") {
+        println!("cargo:rustc-cfg=has_session_new_versioned");
+    }
 
     // Generate highlevel bindings
     #[cfg(feature = "fuse_highlevel")]

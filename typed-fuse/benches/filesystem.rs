@@ -71,7 +71,7 @@ fn run() -> Result<()> {
     })?;
     let result = BenchmarkResult {
         schema_version: SCHEMA_VERSION,
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: utc_timestamp(),
         git_revision: git_revision(),
         mdtest_version,
         host: HostContext {
@@ -535,5 +535,19 @@ fn git_revision() -> String {
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|revision| revision.trim().to_string())
         .filter(|revision| !revision.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Returns the current UTC time as reported by `date`, for display only.
+fn utc_timestamp() -> String {
+    Command::new("date")
+        .arg("-u")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|timestamp| timestamp.trim().to_string())
+        .filter(|timestamp| !timestamp.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
 }

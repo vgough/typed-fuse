@@ -237,8 +237,10 @@ mod imp {
         let mut mounted_at = MountTime::now();
 
         // macOS's macFUSE ships a patched libfuse with an ABI-versioned
-        // `fuse_session_new_versioned()`; vanilla Linux libfuse only has the
-        // plain `fuse_session_new()`.
+        // `fuse_session_new_versioned()`. Vanilla libfuse gained it too, and
+        // from 3.17 `fuse_session_new()` is a macro over a `static inline`
+        // wrapper that bindgen does not emit; build.rs sets
+        // `has_session_new_versioned` when the headers declare it.
         #[cfg(target_os = "macos")]
         let se = unsafe {
             let mut version = libfuse_version {
@@ -258,7 +260,23 @@ mod imp {
                 &mut mounted_at as *mut MountTime as *mut c_void,
             )
         };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(not(target_os = "macos"), has_session_new_versioned))]
+        let se = unsafe {
+            let mut version = libfuse_version {
+                major: FUSE_MAJOR_VERSION as _,
+                minor: FUSE_MINOR_VERSION as _,
+                hotfix: FUSE_HOTFIX_VERSION as _,
+                ..Default::default()
+            };
+            fuse_session_new_versioned(
+                args,
+                &ops,
+                size_of::<fuse_lowlevel_ops>(),
+                &mut version,
+                &mut mounted_at as *mut MountTime as *mut c_void,
+            )
+        };
+        #[cfg(not(any(target_os = "macos", has_session_new_versioned)))]
         let se = unsafe {
             fuse_session_new(
                 args,

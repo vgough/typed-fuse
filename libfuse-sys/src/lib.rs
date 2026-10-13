@@ -23,7 +23,10 @@ pub mod fuse {
     ///
     /// macOS's macFUSE ships a patched libfuse with an ABI-versioned
     /// `fuse_main_real_versioned()` entry point (and the `libfuse_version`
-    /// struct it takes); vanilla Linux libfuse only has the plain
+    /// struct it takes). Vanilla libfuse gained it in 3.17, where
+    /// `fuse_main_real()` became a `static inline` wrapper that bindgen does
+    /// not emit; `has_main_real_versioned` is set by build.rs when the
+    /// headers declare the versioned form. Older libfuse only has the plain
     /// `fuse_main_real()`.
     pub unsafe fn fuse_main(
         argc: c_int,
@@ -49,7 +52,26 @@ pub mod fuse {
                 user_data,
             )
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(not(target_os = "macos"), has_main_real_versioned))]
+        unsafe {
+            // What the `static inline fuse_main_real()` does, since bindgen
+            // cannot emit it.
+            let mut version = libfuse_version {
+                major: FUSE_MAJOR_VERSION as _,
+                minor: FUSE_MINOR_VERSION as _,
+                hotfix: FUSE_HOTFIX_VERSION as _,
+                ..Default::default()
+            };
+            fuse_main_real_versioned(
+                argc,
+                argv,
+                op,
+                std::mem::size_of_val(&*op),
+                &mut version,
+                user_data,
+            )
+        }
+        #[cfg(not(any(target_os = "macos", has_main_real_versioned)))]
         unsafe {
             fuse_main_real(argc, argv, op, std::mem::size_of_val(&*op), user_data)
         }

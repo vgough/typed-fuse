@@ -1,9 +1,10 @@
 //! A synchronous path-based filesystem interface and its [`NodeFs`] adapter.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{
@@ -56,7 +57,7 @@ impl<S: std::fmt::Debug> std::fmt::Debug for PathDirIdentity<S> {
     }
 }
 
-/// A directory-entry sink used by [`PathFilesystem::readdir`].
+/// A directory-entry sink used by [`DirBuffer::fill`].
 pub trait PathDirSink<S> {
     /// Adds one entry. `next_offset` is the resume cookie the kernel will
     /// hand back to continue after this entry. Returns `false` once the
@@ -70,16 +71,17 @@ pub trait PathDirSink<S> {
     ) -> bool;
 }
 
-/// A directory-entry sink used by [`PathFilesystem::readdirplus`].
+/// A directory-entry sink used by [`DirBuffer::fill_plus`].
 pub trait PathPlusDirSink<S> {
-    /// Adds one entry with its attributes. `next_offset` is the resume
-    /// cookie the kernel will hand back to continue after this entry.
-    /// Returns `false` once the buffer is full, at which point the caller
-    /// must stop iterating.
+    /// Adds one entry with its attributes, or `None` for an entry added by
+    /// [`DirBuffer::push`] without them. `next_offset` is the resume cookie
+    /// the kernel will hand back to continue after this entry. Returns
+    /// `false` once the buffer is full, at which point the caller must stop
+    /// iterating.
     fn add(
         &mut self,
         name: &OsStr,
-        attr: NodeAttr,
+        attr: Option<NodeAttr>,
         identity: PathDirIdentity<S>,
         next_offset: u64,
     ) -> bool;
@@ -90,19 +92,19 @@ pub trait PathPlusDirSink<S> {
 pub struct DirEntry<S> {
     pub name: OsString,
     pub kind: FileKind,
-    pub attr: NodeAttr,
+    /// `None` for an entry added by [`DirBuffer::push`].
+    pub attr: Option<NodeAttr>,
     pub identity: PathDirIdentity<S>,
 }
 
-/// An immutable snapshot of a directory's contents, suitable for use as a
-/// [`PathFilesystem::DirHandle`].
+/// An immutable snapshot of a directory's contents returned by
+/// [`PathFilesystem::list_dir`].
 ///
-/// Filesystems typically build one in `opendir` (so all readers of that
-/// handle see a consistent view even if the directory mutates afterward)
-/// and replay it into the kernel's sink from `readdir`/`readdirplus` via
-/// [`DirBuffer::fill`]/[`DirBuffer::fill_plus`], which own the resume-offset
-/// bookkeeping (`next_offset = index + 1`) that the FUSE protocol requires
-/// filesystems to get right themselves.
+/// The path adapter retains the buffer for resumed reads and replays it with
+/// its own resume cookies, which also identify the listing they came from.
+/// [`DirBuffer::fill`]/[`DirBuffer::fill_plus`] serve a buffer with plain
+/// `next_offset = index + 1` cookies for [`NodeFs`] implementations that
+/// keep one themselves.
 #[derive(Clone, Debug, Default)]
 pub struct DirBuffer<S> {
     entries: Vec<DirEntry<S>>,
@@ -115,18 +117,27 @@ impl<S> DirBuffer<S> {
         }
     }
 
-    /// Appends one entry.
-    pub fn push(
-        &mut self,
-        name: impl Into<OsString>,
-        kind: FileKind,
-        attr: NodeAttr,
-        state: Arc<S>,
-    ) {
+    /// Appends one entry with only its kind, which is all a basic `readdir`
+    /// needs. If the adapter serves the entry through `readdirplus`, it calls
+    /// [`PathFilesystem::lookup`] for the attributes, and skips the entry if
+    /// the lookup finds nothing.
+    pub fn push(&mut self, name: impl Into<OsString>, kind: FileKind, state: Arc<S>) {
         self.entries.push(DirEntry {
             name: name.into(),
             kind,
-            attr,
+            attr: None,
+            identity: PathDirIdentity::Child(state),
+        });
+    }
+
+    /// Appends one entry with its attributes, which `readdirplus` sends to
+    /// the kernel without a lookup. The kind is taken from `attr`. Use this
+    /// when the listing already has the attributes.
+    pub fn push_plus(&mut self, name: impl Into<OsString>, attr: NodeAttr, state: Arc<S>) {
+        self.entries.push(DirEntry {
+            name: name.into(),
+            kind: attr.kind,
+            attr: Some(attr),
             identity: PathDirIdentity::Child(state),
         });
     }
@@ -139,13 +150,13 @@ impl<S> DirBuffer<S> {
         self.entries.push(DirEntry {
             name: OsString::from("."),
             kind: FileKind::Directory,
-            attr: self_attr,
+            attr: Some(self_attr),
             identity: PathDirIdentity::Current,
         });
         self.entries.push(DirEntry {
             name: OsString::from(".."),
             kind: FileKind::Directory,
-            attr: parent_attr,
+            attr: Some(parent_attr),
             identity: PathDirIdentity::Parent,
         });
     }
@@ -163,7 +174,7 @@ impl<S> DirBuffer<S> {
     }
 
     /// Replays entries from `offset` onward into `sink`, per
-    /// [`PathFilesystem::readdir`] semantics.
+    /// path-adapter `readdir` semantics.
     pub fn fill(&self, offset: u64, sink: &mut dyn PathDirSink<S>) {
         replay(offset, self.entries.len(), |entry, next_offset| {
             let entry = &self.entries[entry];
@@ -172,7 +183,7 @@ impl<S> DirBuffer<S> {
     }
 
     /// Replays entries from `offset` onward into `sink`, per
-    /// [`PathFilesystem::readdirplus`] semantics.
+    /// path-adapter `readdirplus` semantics.
     pub fn fill_plus(&self, offset: u64, sink: &mut dyn PathPlusDirSink<S>) {
         replay(offset, self.entries.len(), |entry, next_offset| {
             let entry = &self.entries[entry];
@@ -247,7 +258,8 @@ pub trait PathFilesystem: Send + Sync + Sized {
     type NodeState: Send + Sync + 'static;
     /// Per-open-file data. Use `()` if the filesystem is stateless per open.
     type Handle: Send + Sync;
-    /// Per-open-directory data. Use `()` if not needed.
+    /// Per-open-directory data, such as a backing directory file descriptor.
+    /// Use `()` if not needed. The adapter stores directory listings itself.
     type DirHandle: Send + Sync;
 
     /// Builds state for the root node. This is infallible because runtime
@@ -261,8 +273,8 @@ pub trait PathFilesystem: Send + Sync + Sized {
     /// Set to `true` to enable [`PathFilesystem::flock`]. Left disabled by
     /// default since most filesystems delegate BSD locking to the kernel.
     const SUPPORTS_FLOCK: bool = false;
-    /// Set to `true` to enable [`PathFilesystem::readdirplus`], letting the
-    /// kernel populate its attribute cache from directory listings instead
+    /// Set to `true` to let the adapter register `readdirplus`, allowing the
+    /// kernel to populate its attribute cache from directory listings instead
     /// of a follow-up `lookup` per entry.
     const SUPPORTS_READDIRPLUS: bool = false;
 
@@ -470,7 +482,9 @@ pub trait PathFilesystem: Send + Sync + Sized {
         Ok(())
     }
 
-    /// Opens the directory at `path`.
+    /// Opens the directory at `path`, performing access checks and creating
+    /// any per-open state. Directory contents are obtained lazily through
+    /// [`PathFilesystem::list_dir`].
     fn opendir(
         &self,
         node: PathNodeRef<'_, Self::NodeState>,
@@ -480,31 +494,20 @@ pub trait PathFilesystem: Send + Sync + Sized {
         Err(Errno::ENOSYS)
     }
 
-    /// Emits the entries of directory `path` into `sink`, starting at
-    /// `offset`. Push each entry with a strictly increasing `next_offset`
-    /// cookie and stop as soon as [`PathDirSink::add`] returns `false`.
-    fn readdir(
+    /// Lists the directory's current contents.
+    ///
+    /// Include `.` and `..` when desired, usually through
+    /// [`DirBuffer::push_dots`]. Add children with [`DirBuffer::push`], or
+    /// with [`DirBuffer::push_plus`] when their attributes are at hand. The
+    /// adapter calls this on the first read and
+    /// whenever a read starts again at offset zero, then retains the returned
+    /// buffer for resumed reads. It is never called directly by the kernel.
+    fn list_dir(
         &self,
         node: PathNodeRef<'_, Self::NodeState>,
         handle: &Self::DirHandle,
-        offset: u64,
-        sink: &mut dyn PathDirSink<Self::NodeState>,
         caller: &Caller,
-    ) -> Result<(), Errno> {
-        Err(Errno::ENOSYS)
-    }
-
-    /// Like [`PathFilesystem::readdir`], but emits attributes alongside each
-    /// entry via [`PathPlusDirSink`]. Only called when
-    /// [`PathFilesystem::SUPPORTS_READDIRPLUS`] is `true`.
-    fn readdirplus(
-        &self,
-        node: PathNodeRef<'_, Self::NodeState>,
-        handle: &Self::DirHandle,
-        offset: u64,
-        sink: &mut dyn PathPlusDirSink<Self::NodeState>,
-        caller: &Caller,
-    ) -> Result<(), Errno> {
+    ) -> Result<DirBuffer<Self::NodeState>, Errno> {
         Err(Errno::ENOSYS)
     }
 
@@ -678,9 +681,32 @@ pub struct PathNode<S> {
     key: u64,
     state: Arc<S>,
     entry_attr: Mutex<Option<NodeAttr>>,
+    /// Counts namespace mutations routed through the adapter that add,
+    /// remove, or replace a name in this directory.
+    entries_epoch: AtomicU64,
 }
 
 impl<S> PathNode<S> {
+    fn new(key: u64, state: Arc<S>) -> Self {
+        Self {
+            key,
+            state,
+            entry_attr: Mutex::new(None),
+            entries_epoch: AtomicU64::new(0),
+        }
+    }
+
+    /// Records a change to this directory's names. Callers hold the
+    /// adapter's `operations` lock exclusively, which orders the bump against
+    /// listings taken under the shared lock.
+    fn entries_changed(&self) {
+        self.entries_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn entries_epoch(&self) -> u64 {
+        self.entries_epoch.load(Ordering::Relaxed)
+    }
+
     fn set_entry_attr(&self, attr: NodeAttr) {
         *mutex(&self.entry_attr) = Some(attr);
     }
@@ -754,14 +780,7 @@ impl Namespace {
             .next_key
             .checked_add(1)
             .expect("path node key overflow");
-        let id = cx.insert(
-            PathNode {
-                key,
-                state,
-                entry_attr: Mutex::new(None),
-            },
-            parent,
-        );
+        let id = cx.insert(PathNode::new(key, state), parent);
         self.keys.insert(key, id);
         self.by_name.insert(dentry.clone(), id);
         self.aliases.entry(id).or_default().insert(dentry);
@@ -783,6 +802,123 @@ impl Namespace {
         self.by_name.insert(dentry.clone(), id);
         self.aliases.entry(id).or_default().insert(dentry);
     }
+}
+
+/// Resume cookies issued by [`PathNodeFs`] hold `index + 1` in the low
+/// `COOKIE_INDEX_BITS` bits and the issuing listing's generation in the four
+/// bits above, so a resumed read finds the listing it was reading even when
+/// another stream has since started a newer one on the same handle. Every
+/// cookie stays below 2^31, which keeps it valid for 32-bit `off_t` readers.
+const COOKIE_INDEX_BITS: u32 = 27;
+const COOKIE_INDEX_MASK: u64 = (1 << COOKIE_INDEX_BITS) - 1;
+const COOKIE_GENERATIONS: u8 = 16;
+/// The most entries a listing can hold and still fit its cookies.
+const MAX_LISTING_LEN: usize = COOKIE_INDEX_MASK as usize;
+/// Listings kept per directory handle for resumed reads.
+const RETAINED_LISTINGS: usize = 4;
+
+fn listing_cookie(generation: u8, index: usize) -> u64 {
+    (u64::from(generation) << COOKIE_INDEX_BITS) | (index as u64 + 1)
+}
+
+/// Splits a cookie into the generation that issued it and the index to
+/// resume from.
+fn split_cookie(offset: u64) -> (u8, u64) {
+    let generation = (offset >> COOKIE_INDEX_BITS) & u64::from(COOKIE_GENERATIONS - 1);
+    (generation as u8, offset & COOKIE_INDEX_MASK)
+}
+
+/// One [`PathFilesystem::list_dir`] result held for resumed reads.
+struct DirListing<S> {
+    generation: u8,
+    /// The directory's `entries_epoch` when the listing was taken.
+    epoch: u64,
+    buffer: DirBuffer<S>,
+}
+
+/// What a directory read continues.
+enum DirRead<S> {
+    /// Replay `listing` from index `start`. `owned` is false when the
+    /// cookie's own listing was evicted and the read borrows the current one.
+    Listing {
+        listing: Arc<DirListing<S>>,
+        start: u64,
+        owned: bool,
+    },
+    /// The cookie's listing already ended at or before this index.
+    Ended,
+}
+
+struct DirListings<S> {
+    next_generation: u8,
+    /// Oldest first; the last listing is the current one.
+    retained: VecDeque<Arc<DirListing<S>>>,
+    /// For each generation, the index at which its dropped listing ended.
+    /// The kernel can repeat the read at the end of a stream (FreeBSD's
+    /// `getdents` always does), and that read must stay empty rather than
+    /// list the directory again.
+    ended: [Option<u64>; COOKIE_GENERATIONS as usize],
+}
+
+impl<S> DirListings<S> {
+    fn new() -> Self {
+        Self {
+            next_generation: 0,
+            retained: VecDeque::with_capacity(RETAINED_LISTINGS),
+            ended: [None; COOKIE_GENERATIONS as usize],
+        }
+    }
+
+    fn has_ended(&self, generation: u8, index: u64) -> bool {
+        self.ended[usize::from(generation)].is_some_and(|end| index >= end)
+    }
+
+    fn get(&self, generation: u8) -> Option<Arc<DirListing<S>>> {
+        self.retained
+            .iter()
+            .find(|listing| listing.generation == generation)
+            .cloned()
+    }
+
+    fn current(&self) -> Option<Arc<DirListing<S>>> {
+        self.retained.back().cloned()
+    }
+
+    /// Drops `listing` after a read at index `end` sent nothing, and
+    /// remembers where it ended unless it was already evicted, in which
+    /// case its generation may belong to a newer listing.
+    fn finish(&mut self, listing: &Arc<DirListing<S>>, end: u64) {
+        let before = self.retained.len();
+        self.retained
+            .retain(|retained| !Arc::ptr_eq(retained, listing));
+        if self.retained.len() != before {
+            self.ended[usize::from(listing.generation)] = Some(end);
+        }
+    }
+
+    fn push(&mut self, epoch: u64, buffer: DirBuffer<S>) -> Arc<DirListing<S>> {
+        let listing = Arc::new(DirListing {
+            generation: self.next_generation,
+            epoch,
+            buffer,
+        });
+        self.ended[usize::from(listing.generation)] = None;
+        self.next_generation = (self.next_generation + 1) % COOKIE_GENERATIONS;
+        if self.retained.len() == RETAINED_LISTINGS {
+            self.retained.pop_front();
+        }
+        self.retained.push_back(Arc::clone(&listing));
+        listing
+    }
+}
+
+/// Adapter-owned state for an open path-based directory.
+///
+/// The filesystem's own handle is retained in `inner`. The most recent
+/// listings are shared by basic and plus directory reads.
+pub struct PathDirHandle<P: PathFilesystem> {
+    inner: P::DirHandle,
+    listings: Mutex<DirListings<P::NodeState>>,
 }
 
 /// Adapts a [`PathFilesystem`] to the node-based runtime.
@@ -834,22 +970,34 @@ impl<P: PathFilesystem> PathNodeFs<P> {
         Ok(id)
     }
 
-    fn add_enumerated_node(
+    /// Offers one listed entry to the kernel buffer through `add`. A child
+    /// whose dentry this call inserted is removed again if `add` rejects it.
+    fn add_listed_entry(
         &self,
         cx: &Cx<'_, PathNode<P::NodeState>>,
+        this: NodeId,
         parent: NodeId,
-        name: &OsStr,
-        state: Arc<P::NodeState>,
-    ) -> Result<(NodeId, Option<Dentry>), Errno>
-    where
-        P: PathFilesystem,
-    {
-        let (id, inserted) = mutex(&self.namespace).insert(cx, parent, name, state);
-        let dentry = inserted.then(|| Dentry {
-            parent,
-            name: name.to_os_string(),
-        });
-        Ok((id, dentry))
+        entry: &DirEntry<P::NodeState>,
+        add: impl FnOnce(NodeId) -> bool,
+    ) -> bool {
+        let (id, inserted) = match &entry.identity {
+            PathDirIdentity::Current => (this, None),
+            PathDirIdentity::Parent => (parent, None),
+            PathDirIdentity::Child(state) => {
+                let (id, inserted) =
+                    mutex(&self.namespace).insert(cx, this, &entry.name, Arc::clone(state));
+                let dentry = inserted.then(|| Dentry {
+                    parent: this,
+                    name: entry.name.clone(),
+                });
+                (id, dentry)
+            }
+        };
+        let accepted = add(id);
+        if !accepted && let Some(dentry) = inserted {
+            self.rollback_dentry(cx, &dentry);
+        }
+        accepted
     }
 
     fn rollback_dentry(&self, cx: &Cx<'_, PathNode<P::NodeState>>, dentry: &Dentry) {
@@ -857,23 +1005,148 @@ impl<P: PathFilesystem> PathNodeFs<P> {
             cx.remove_link(id);
         }
     }
+
+    /// Returns what a read at `offset` continues. Callers hold the
+    /// `operations` lock shared.
+    fn directory_listing(
+        &self,
+        dir: &PathNode<P::NodeState>,
+        path: &Path,
+        handle: &PathDirHandle<P>,
+        offset: u64,
+        caller: &Caller,
+    ) -> Result<DirRead<P::NodeState>, Errno> {
+        let (generation, start) = split_cookie(offset);
+        if offset != 0 {
+            let listings = mutex(&handle.listings);
+            if let Some(listing) = listings.get(generation) {
+                return Ok(DirRead::Listing {
+                    listing,
+                    start,
+                    owned: true,
+                });
+            }
+            if listings.has_ended(generation, start) {
+                return Ok(DirRead::Ended);
+            }
+            // If the cookie's listing has been evicted, resume the current
+            // one by index rather than failing the read.
+            if let Some(listing) = listings.current() {
+                return Ok(DirRead::Listing {
+                    listing,
+                    start,
+                    owned: false,
+                });
+            }
+        }
+
+        // Filesystem I/O deliberately runs outside the handle mutex. An
+        // unsuccessful refresh leaves the retained listings untouched. Name
+        // changes take the `operations` lock exclusively, so the epoch can't
+        // move while `list_dir` runs.
+        let epoch = dir.entries_epoch();
+        let buffer = self.inner.list_dir(
+            PathNodeRef {
+                path: Some(path),
+                state: &dir.state,
+            },
+            &handle.inner,
+            caller,
+        )?;
+        if buffer.len() > MAX_LISTING_LEN {
+            return Err(Errno::EOVERFLOW);
+        }
+        Ok(DirRead::Listing {
+            listing: mutex(&handle.listings).push(epoch, buffer),
+            start,
+            owned: true,
+        })
+    }
+
+    /// Replays `listing` from `start` into `emit`, which returns `false`
+    /// once the reply is full, and returns how many entries `emit` accepted.
+    /// A `plus` read needs attributes for every entry it sends.
+    ///
+    /// A child is looked up again before it's sent if a name in the directory
+    /// has changed through the adapter since the listing was taken, or if
+    /// this is a `plus` read and the child was listed without attributes. A
+    /// name the lookup doesn't find (`None` or `ENOENT`) is skipped, so it's
+    /// neither reported nor put back into the namespace. A name it finds is
+    /// sent with its current attributes and state. If the lookup fails any
+    /// other way, the listed entry is sent if it's usable for this read.
+    /// Otherwise the reply ends before that entry, and the error is returned
+    /// if nothing was accepted, so the read that reaches it reports it.
+    #[allow(clippy::too_many_arguments)]
+    fn replay_listing(
+        &self,
+        dir: &PathNode<P::NodeState>,
+        path: &Path,
+        listing: &DirListing<P::NodeState>,
+        start: u64,
+        plus: bool,
+        caller: &Caller,
+        mut emit: impl FnMut(&DirEntry<P::NodeState>, u64) -> bool,
+    ) -> Result<usize, Errno> {
+        let stale = dir.entries_epoch() != listing.epoch;
+        let entries = &listing.buffer.entries;
+        let mut accepted = 0;
+        let mut failure = None;
+        replay(start, entries.len(), |index, _| {
+            let listed = &entries[index];
+            let next_offset = listing_cookie(listing.generation, index);
+            let needs_lookup = matches!(listed.identity, PathDirIdentity::Child(_))
+                && (stale || (plus && listed.attr.is_none()));
+            let current;
+            let entry = if needs_lookup {
+                let parent = PathNodeRef {
+                    path: Some(path),
+                    state: &dir.state,
+                };
+                match self.inner.lookup(parent, &listed.name, caller) {
+                    Ok(None) => return true,
+                    Err(error) if error == Errno::ENOENT => return true,
+                    Ok(Some(found)) => {
+                        current = DirEntry {
+                            name: listed.name.clone(),
+                            kind: found.attr.kind,
+                            attr: Some(found.attr),
+                            identity: PathDirIdentity::Child(found.state),
+                        };
+                        &current
+                    }
+                    Err(_) if !plus || listed.attr.is_some() => listed,
+                    Err(error) => {
+                        failure = Some(error);
+                        return false;
+                    }
+                }
+            } else {
+                listed
+            };
+            if !emit(entry, next_offset) {
+                return false;
+            }
+            accepted += 1;
+            true
+        });
+        match failure {
+            Some(error) if accepted == 0 => Err(error),
+            _ => Ok(accepted),
+        }
+    }
 }
 
 impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     type Node = PathNode<P::NodeState>;
     type Handle = P::Handle;
-    type DirHandle = P::DirHandle;
+    type DirHandle = PathDirHandle<P>;
 
     const SUPPORTS_POSIX_LOCKS: bool = P::SUPPORTS_POSIX_LOCKS;
     const SUPPORTS_FLOCK: bool = P::SUPPORTS_FLOCK;
     const SUPPORTS_READDIRPLUS: bool = P::SUPPORTS_READDIRPLUS;
 
     fn root(&mut self) -> Self::Node {
-        PathNode {
-            key: 1,
-            state: self.inner.root_state(),
-            entry_attr: Mutex::new(None),
-        }
+        PathNode::new(1, self.inner.root_state())
     }
     fn init(&self, conn: &mut ConnInfo) {
         self.inner.init(conn)
@@ -988,6 +1261,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     ) -> Result<NodeId, Errno> {
         let _guard = write_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
+        parent_node.entries_changed();
         let parent_path = self.path(parent)?;
         let entry = self.inner.mknod(
             PathNodeRef {
@@ -1014,6 +1288,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     ) -> Result<NodeId, Errno> {
         let _guard = write_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
+        parent_node.entries_changed();
         let parent_path = self.path(parent)?;
         let entry = self.inner.mkdir(
             PathNodeRef {
@@ -1038,6 +1313,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     ) -> Result<NodeId, Errno> {
         let _guard = write_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
+        parent_node.entries_changed();
         let parent_path = self.path(parent)?;
         let entry = self.inner.symlink(
             PathNodeRef {
@@ -1087,6 +1363,8 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         let _guard = write_lock(&self.operations);
         let old_parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         let new_parent_node = cx.get(newparent).ok_or(Errno::ENOENT)?;
+        old_parent_node.entries_changed();
+        new_parent_node.entries_changed();
         let old_parent_path = self.path(parent)?;
         let new_parent_path = self.path(newparent)?;
         self.inner.rename(
@@ -1137,6 +1415,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         let _guard = write_lock(&self.operations);
         let source_node = cx.get(id).ok_or(Errno::ENOENT)?;
         let parent_node = cx.get(newparent).ok_or(Errno::ENOENT)?;
+        parent_node.entries_changed();
         let source = self.path(id)?;
         let parent = self.path(newparent)?;
         self.inner.link(
@@ -1281,17 +1560,24 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         node: &PathNode<P::NodeState>,
         flags: i32,
         caller: &Caller,
-    ) -> Result<Opened<P::DirHandle>, Errno> {
+    ) -> Result<Opened<PathDirHandle<P>>, Errno> {
         let _g = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
-        self.inner.opendir(
+        let opened = self.inner.opendir(
             PathNodeRef {
                 path: Some(&path),
                 state: &node.state,
             },
             flags,
             caller,
-        )
+        )?;
+        Ok(Opened {
+            handle: PathDirHandle {
+                inner: opened.handle,
+                listings: Mutex::new(DirListings::new()),
+            },
+            hints: opened.hints,
+        })
     }
 
     fn readdir(
@@ -1300,37 +1586,40 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         node: &PathNode<P::NodeState>,
         this: NodeId,
         parent: NodeId,
-        handle: &P::DirHandle,
+        handle: &PathDirHandle<P>,
         offset: u64,
         sink: &mut dyn DirSink,
         caller: &Caller,
     ) -> Result<(), Errno> {
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
-        let mut adapter = BasicSink {
-            owner: self,
-            cx,
-            this,
-            parent,
-            output: sink,
-            inserted: Vec::new(),
-            error: None,
+        let DirRead::Listing {
+            listing,
+            start,
+            owned,
+        } = self.directory_listing(node, &path, handle, offset, caller)?
+        else {
+            return Ok(());
         };
-        let result = self.inner.readdir(
-            PathNodeRef {
-                path: Some(&path),
-                state: &node.state,
-            },
-            handle,
-            offset,
-            &mut adapter,
+        let accepted = self.replay_listing(
+            node,
+            &path,
+            &listing,
+            start,
+            false,
             caller,
-        );
-        if result.is_err() || adapter.error.is_some() {
-            adapter.rollback();
+            |entry, next_offset| {
+                self.add_listed_entry(cx, this, parent, entry, |id| {
+                    sink.add(&entry.name, id, entry.kind, next_offset)
+                })
+            },
+        )?;
+        // An empty reply ends the stream for the kernel, so the listing won't
+        // be resumed again. A borrowed listing belongs to another stream.
+        if accepted == 0 && owned {
+            mutex(&handle.listings).finish(&listing, start);
         }
-        result?;
-        adapter.error.map_or(Ok(()), Err)
+        Ok(())
     }
 
     fn readdirplus(
@@ -1339,60 +1628,67 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         node: &PathNode<P::NodeState>,
         this: NodeId,
         parent: NodeId,
-        handle: &P::DirHandle,
+        handle: &PathDirHandle<P>,
         offset: u64,
         sink: &mut dyn PlusDirSink,
         caller: &Caller,
     ) -> Result<(), Errno> {
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
-        let mut adapter = PlusSink {
-            owner: self,
-            cx,
-            this,
-            parent,
-            output: sink,
-            inserted: Vec::new(),
-            error: None,
+        let DirRead::Listing {
+            listing,
+            start,
+            owned,
+        } = self.directory_listing(node, &path, handle, offset, caller)?
+        else {
+            return Ok(());
         };
-        let result = self.inner.readdirplus(
-            PathNodeRef {
-                path: Some(&path),
-                state: &node.state,
-            },
-            handle,
-            offset,
-            &mut adapter,
+        let accepted = self.replay_listing(
+            node,
+            &path,
+            &listing,
+            start,
+            true,
             caller,
-        );
-        if result.is_err() || adapter.error.is_some() {
-            adapter.rollback();
+            |entry, next_offset| {
+                self.add_listed_entry(cx, this, parent, entry, |id| {
+                    let attr = entry
+                        .attr
+                        .expect("replay_listing supplies attributes for plus reads");
+                    sink.add(&entry.name, id, attr, next_offset)
+                })
+            },
+        )?;
+        // An empty reply ends the stream for the kernel, so the listing won't
+        // be resumed again. A borrowed listing belongs to another stream.
+        if accepted == 0 && owned {
+            mutex(&handle.listings).finish(&listing, start);
         }
-        result?;
-        adapter.error.map_or(Ok(()), Err)
+        Ok(())
     }
 
     fn releasedir(
         &self,
         node: &PathNode<P::NodeState>,
-        handle: P::DirHandle,
+        handle: PathDirHandle<P>,
         caller: &Caller,
     ) -> Result<(), Errno> {
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
+        let PathDirHandle { inner, .. } = handle;
         self.inner.releasedir(
             PathNodeRef {
                 path: p.as_deref(),
                 state: &node.state,
             },
-            handle,
+            inner,
             caller,
         )
     }
     fn fsyncdir(
         &self,
         node: &PathNode<P::NodeState>,
-        handle: &P::DirHandle,
+        handle: &PathDirHandle<P>,
         datasync: bool,
         caller: &Caller,
     ) -> Result<(), Errno> {
@@ -1403,7 +1699,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
                 path: p.as_deref(),
                 state: &node.state,
             },
-            handle,
+            &handle.inner,
             datasync,
             caller,
         )
@@ -1517,6 +1813,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     ) -> Result<(NodeId, Opened<P::Handle>), Errno> {
         let _g = write_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
+        parent_node.entries_changed();
         let parent_path = self.path(parent)?;
         let (entry, opened) = self.inner.create(
             PathNodeRef {
@@ -1651,6 +1948,7 @@ impl<P: PathFilesystem> PathNodeFs<P> {
     ) -> Result<(), Errno> {
         let _guard = write_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
+        parent_node.entries_changed();
         let parent_path = self.path(parent)?;
         if directory {
             self.inner.rmdir(
@@ -1682,112 +1980,14 @@ impl<P: PathFilesystem> PathNodeFs<P> {
     }
 }
 
-struct BasicSink<'a, 'b, P: PathFilesystem> {
-    owner: &'a PathNodeFs<P>,
-    cx: &'a Cx<'b, PathNode<P::NodeState>>,
-    this: NodeId,
-    parent: NodeId,
-    output: &'a mut dyn DirSink,
-    inserted: Vec<Dentry>,
-    error: Option<Errno>,
-}
-impl<P: PathFilesystem> BasicSink<'_, '_, P> {
-    fn rollback(&mut self) {
-        for dentry in self.inserted.drain(..).rev() {
-            self.owner.rollback_dentry(self.cx, &dentry);
-        }
-    }
-}
-impl<P: PathFilesystem> PathDirSink<P::NodeState> for BasicSink<'_, '_, P> {
-    fn add(
-        &mut self,
-        name: &OsStr,
-        kind: FileKind,
-        identity: PathDirIdentity<P::NodeState>,
-        next_offset: u64,
-    ) -> bool {
-        let (id, inserted) = match identity {
-            PathDirIdentity::Current => (self.this, None),
-            PathDirIdentity::Parent => (self.parent, None),
-            PathDirIdentity::Child(state) => match self
-                .owner
-                .add_enumerated_node(self.cx, self.this, name, state)
-            {
-                Ok(node) => node,
-                Err(error) => {
-                    self.error = Some(error);
-                    return false;
-                }
-            },
-        };
-        let accepted = self.output.add(name, id, kind, next_offset);
-        if let Some(dentry) = inserted {
-            if accepted {
-                self.inserted.push(dentry);
-            } else {
-                self.owner.rollback_dentry(self.cx, &dentry);
-            }
-        }
-        accepted
-    }
-}
-struct PlusSink<'a, 'b, P: PathFilesystem> {
-    owner: &'a PathNodeFs<P>,
-    cx: &'a Cx<'b, PathNode<P::NodeState>>,
-    this: NodeId,
-    parent: NodeId,
-    output: &'a mut dyn PlusDirSink,
-    inserted: Vec<Dentry>,
-    error: Option<Errno>,
-}
-impl<P: PathFilesystem> PlusSink<'_, '_, P> {
-    fn rollback(&mut self) {
-        for dentry in self.inserted.drain(..).rev() {
-            self.owner.rollback_dentry(self.cx, &dentry);
-        }
-    }
-}
-impl<P: PathFilesystem> PathPlusDirSink<P::NodeState> for PlusSink<'_, '_, P> {
-    fn add(
-        &mut self,
-        name: &OsStr,
-        attr: NodeAttr,
-        identity: PathDirIdentity<P::NodeState>,
-        next_offset: u64,
-    ) -> bool {
-        let (id, inserted) = match identity {
-            PathDirIdentity::Current => (self.this, None),
-            PathDirIdentity::Parent => (self.parent, None),
-            PathDirIdentity::Child(state) => match self
-                .owner
-                .add_enumerated_node(self.cx, self.this, name, state)
-            {
-                Ok(node) => node,
-                Err(error) => {
-                    self.error = Some(error);
-                    return false;
-                }
-            },
-        };
-        let accepted = self.output.add(name, id, attr, next_offset);
-        if let Some(dentry) = inserted {
-            if accepted {
-                self.inserted.push(dentry);
-            } else {
-                self.owner.rollback_dentry(self.cx, &dentry);
-            }
-        }
-        accepted
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
     use super::*;
-    use crate::{LookupReply, Runtime};
+    use crate::{EntryReply, LookupReply, Runtime, RuntimePlusSink};
 
     #[test]
     fn replay_emits_index_plus_one_cookies_from_offset() {
@@ -1830,19 +2030,55 @@ mod tests {
         assert!(emitted.is_empty());
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct RecordingFs {
         getattr_paths: Arc<Mutex<Vec<Option<PathBuf>>>>,
         getattr_states: Arc<Mutex<Vec<Arc<usize>>>>,
         forgotten_paths: Arc<Mutex<Vec<Option<PathBuf>>>>,
-        next_state: Arc<std::sync::atomic::AtomicUsize>,
-        alternate_dir_identity: bool,
+        next_state: Arc<AtomicUsize>,
+        removed_names: Arc<Mutex<BTreeSet<OsString>>>,
+        directory_names: Arc<Mutex<Vec<OsString>>>,
+        list_calls: Arc<AtomicUsize>,
+        fail_next_list: Arc<AtomicBool>,
+        list_barrier: Option<Arc<Barrier>>,
+        include_dots: bool,
+        kind_only: bool,
+        removed_lookup_fails: bool,
+        failing_lookups: Arc<Mutex<BTreeSet<OsString>>>,
+        dir_handle: usize,
+        fsyncdir_handles: Arc<Mutex<Vec<usize>>>,
+        releasedir_handles: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Default for RecordingFs {
+        fn default() -> Self {
+            Self {
+                getattr_paths: Arc::default(),
+                getattr_states: Arc::default(),
+                forgotten_paths: Arc::default(),
+                next_state: Arc::default(),
+                removed_names: Arc::default(),
+                directory_names: Arc::new(Mutex::new(vec![OsString::from("enumerated")])),
+                list_calls: Arc::default(),
+                fail_next_list: Arc::default(),
+                list_barrier: None,
+                include_dots: false,
+                kind_only: false,
+                removed_lookup_fails: false,
+                failing_lookups: Arc::default(),
+                dir_handle: 41,
+                fsyncdir_handles: Arc::default(),
+                releasedir_handles: Arc::default(),
+            }
+        }
     }
 
     impl PathFilesystem for RecordingFs {
         type NodeState = usize;
         type Handle = ();
-        type DirHandle = ();
+        type DirHandle = usize;
+
+        const SUPPORTS_READDIRPLUS: bool = true;
 
         fn root_state(&mut self) -> Arc<Self::NodeState> {
             Arc::new(0)
@@ -1851,9 +2087,19 @@ mod tests {
         fn lookup(
             &self,
             _parent: PathNodeRef<'_, Self::NodeState>,
-            _name: &OsStr,
+            name: &OsStr,
             _caller: &Caller,
         ) -> Result<Option<PathEntry<Self::NodeState>>, Errno> {
+            if mutex(&self.failing_lookups).contains(name) {
+                return Err(Errno::EIO);
+            }
+            if mutex(&self.removed_names).contains(name) {
+                return if self.removed_lookup_fails {
+                    Err(Errno::ENOENT)
+                } else {
+                    Ok(None)
+                };
+            }
             let state = self
                 .next_state
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1906,10 +2152,28 @@ mod tests {
         fn unlink(
             &self,
             _parent: PathNodeRef<'_, Self::NodeState>,
-            _name: &OsStr,
+            name: &OsStr,
             _caller: &Caller,
         ) -> Result<(), Errno> {
+            mutex(&self.removed_names).insert(name.to_os_string());
             Ok(())
+        }
+
+        fn create(
+            &self,
+            _parent: PathNodeRef<'_, Self::NodeState>,
+            name: &OsStr,
+            _mode: u32,
+            _umask: u32,
+            _flags: i32,
+            _caller: &Caller,
+        ) -> Result<(PathEntry<Self::NodeState>, Opened<Self::Handle>), Errno> {
+            mutex(&self.removed_names).remove(name);
+            let state = self.next_state.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok((
+                PathEntry::new(NodeAttr::default(), Arc::new(state)),
+                Opened::new(()),
+            ))
         }
 
         fn open(
@@ -1927,33 +2191,60 @@ mod tests {
             _flags: i32,
             _caller: &Caller,
         ) -> Result<Opened<Self::DirHandle>, Errno> {
-            Ok(Opened::new(()))
+            Ok(Opened::new(self.dir_handle).cache_readdir(true))
         }
 
-        fn readdir(
+        fn list_dir(
             &self,
             _node: PathNodeRef<'_, Self::NodeState>,
             _handle: &Self::DirHandle,
-            _offset: u64,
-            sink: &mut dyn PathDirSink<Self::NodeState>,
+            _caller: &Caller,
+        ) -> Result<DirBuffer<Self::NodeState>, Errno> {
+            let call = self.list_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(barrier) = &self.list_barrier {
+                barrier.wait();
+            }
+            if self.fail_next_list.swap(false, Ordering::SeqCst) {
+                return Err(Errno::EIO);
+            }
+            let mut listing = DirBuffer::new();
+            if self.include_dots {
+                listing.push_dots(NodeAttr::default(), NodeAttr::default());
+            }
+            for name in mutex(&self.directory_names).iter() {
+                let state = Arc::new(10_000 + call);
+                if self.kind_only {
+                    listing.push(name, FileKind::RegularFile, state);
+                } else {
+                    let attr = NodeAttr {
+                        kind: FileKind::RegularFile,
+                        ..Default::default()
+                    };
+                    listing.push_plus(name, attr, state);
+                }
+            }
+            Ok(listing)
+        }
+
+        fn fsyncdir(
+            &self,
+            _node: PathNodeRef<'_, Self::NodeState>,
+            handle: &Self::DirHandle,
+            _datasync: bool,
             _caller: &Caller,
         ) -> Result<(), Errno> {
-            assert!(sink.add(
-                OsStr::new("enumerated"),
-                FileKind::RegularFile,
-                PathDirIdentity::Child(Arc::new(1)),
-                1,
-            ));
-            if self.alternate_dir_identity {
-                assert!(sink.add(
-                    OsStr::new("self"),
-                    FileKind::Directory,
-                    PathDirIdentity::Current,
-                    2,
-                ));
-                return Ok(());
-            }
-            Err(Errno::EIO)
+            mutex(&self.fsyncdir_handles).push(*handle);
+            Ok(())
+        }
+
+        fn releasedir(
+            &self,
+            _node: PathNodeRef<'_, Self::NodeState>,
+            handle: Self::DirHandle,
+            _caller: &Caller,
+        ) -> Result<(), Errno> {
+            mutex(&self.releasedir_handles).push(handle);
+            Ok(())
         }
     }
 
@@ -2162,47 +2453,728 @@ mod tests {
         assert!(Arc::ptr_eq(&original, mutex(&states).last().unwrap()));
     }
 
-    struct AcceptingSink;
-    impl DirSink for AcceptingSink {
-        fn add(&mut self, _name: &OsStr, _id: NodeId, _kind: FileKind, _next_offset: u64) -> bool {
+    #[derive(Default)]
+    struct CollectingSink {
+        seen: Vec<(OsString, NodeId, u64)>,
+        accept_limit: Option<usize>,
+    }
+
+    impl DirSink for CollectingSink {
+        fn add(&mut self, name: &OsStr, id: NodeId, _kind: FileKind, next_offset: u64) -> bool {
+            if self.accept_limit == Some(self.seen.len()) {
+                return false;
+            }
+            self.seen.push((name.to_os_string(), id, next_offset));
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct CollectingPlusSink {
+        seen: Vec<(OsString, u64, u64)>,
+        sizes: Vec<u64>,
+        accept_limit: Option<usize>,
+    }
+
+    impl RuntimePlusSink for CollectingPlusSink {
+        fn add(&mut self, name: &OsStr, entry: EntryReply, next_offset: u64) -> bool {
+            if self.accept_limit == Some(self.seen.len()) {
+                return false;
+            }
+            self.seen
+                .push((name.to_os_string(), entry.ino, next_offset));
+            self.sizes.push(entry.attr.size);
             true
         }
     }
 
     #[test]
-    fn failed_readdir_rolls_back_new_namespace_entries() {
-        let runtime = Runtime::new(PathNodeFs::new(RecordingFs::default()));
+    fn opendir_is_lazy_and_preserves_hints() {
+        let recording = RecordingFs::default();
+        let list_calls = Arc::clone(&recording.list_calls);
+        let runtime = Runtime::new(PathNodeFs::new(recording));
         let caller = Caller::default();
         let open = runtime.opendir(1, 0, &caller).unwrap();
-        assert_eq!(
-            runtime.readdir(1, open.fh, 0, &mut AcceptingSink, &caller),
-            Err(Errno::EIO)
-        );
+        assert!(open.hints.cache_readdir);
+        assert_eq!(list_calls.load(Ordering::SeqCst), 0);
 
-        // A stale dentry would point at the node that was retired during
-        // rollback, causing entry construction to fail with ENOENT.
-        assert!(matches!(
-            runtime.lookup(1, OsStr::new("enumerated"), &caller),
-            Ok(LookupReply::Found(_))
-        ));
+        runtime
+            .readdir(1, open.fh, 0, &mut CollectingSink::default(), &caller)
+            .unwrap();
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn current_directory_identity_accepts_a_nonstandard_name() {
+    fn offset_zero_refreshes_the_listing() {
+        let recording = RecordingFs::default();
+        let names = Arc::clone(&recording.directory_names);
+        let list_calls = Arc::clone(&recording.list_calls);
+        *mutex(&names) = vec![OsString::from("old")];
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+
+        let mut first = CollectingSink::default();
+        runtime.readdir(1, open.fh, 0, &mut first, &caller).unwrap();
+        *mutex(&names) = vec![OsString::from("new")];
+        let mut second = CollectingSink::default();
+        runtime
+            .readdir(1, open.fh, 0, &mut second, &caller)
+            .unwrap();
+
+        assert_eq!(first.seen[0].0, OsStr::new("old"));
+        assert_eq!(second.seen[0].0, OsStr::new("new"));
+        assert_eq!(list_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn nonzero_offset_resumes_the_existing_listing() {
+        let recording = RecordingFs::default();
+        let names = Arc::clone(&recording.directory_names);
+        let list_calls = Arc::clone(&recording.list_calls);
+        *mutex(&names) = vec![OsString::from("a"), OsString::from("b")];
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+
+        let mut first = CollectingSink {
+            accept_limit: Some(1),
+            ..Default::default()
+        };
+        runtime.readdir(1, open.fh, 0, &mut first, &caller).unwrap();
+        *mutex(&names) = vec![OsString::from("changed")];
+        let mut resumed = CollectingSink::default();
+        runtime
+            .readdir(1, open.fh, 1, &mut resumed, &caller)
+            .unwrap();
+
+        assert_eq!(first.seen[0].0, OsStr::new("a"));
+        assert_eq!(resumed.seen[0].0, OsStr::new("b"));
+        assert_eq!(resumed.seen[0].2, 2);
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn nonzero_offset_without_a_listing_lists_once() {
+        let recording = RecordingFs::default();
+        let names = Arc::clone(&recording.directory_names);
+        let list_calls = Arc::clone(&recording.list_calls);
+        *mutex(&names) = vec![OsString::from("a"), OsString::from("b")];
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut sink = CollectingSink::default();
+
+        runtime.readdir(1, open.fh, 1, &mut sink, &caller).unwrap();
+
+        assert_eq!(sink.seen[0].0, OsStr::new("b"));
+        assert_eq!(sink.seen[0].2, 2);
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn readdir_and_readdirplus_share_a_listing() {
+        let recording = RecordingFs::default();
+        let names = Arc::clone(&recording.directory_names);
+        let list_calls = Arc::clone(&recording.list_calls);
+        *mutex(&names) = vec![OsString::from("a"), OsString::from("b")];
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut basic = CollectingSink {
+            accept_limit: Some(1),
+            ..Default::default()
+        };
+        runtime.readdir(1, open.fh, 0, &mut basic, &caller).unwrap();
+        *mutex(&names) = vec![OsString::from("changed")];
+        let mut plus = CollectingPlusSink::default();
+
+        runtime
+            .readdirplus(1, open.fh, 1, &mut plus, &caller)
+            .unwrap();
+
+        assert_eq!(plus.seen[0].0, OsStr::new("b"));
+        assert_eq!(plus.seen[0].2, 2);
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_refresh_leaves_the_previous_listing_in_place() {
+        let recording = RecordingFs::default();
+        let names = Arc::clone(&recording.directory_names);
+        let fail_next = Arc::clone(&recording.fail_next_list);
+        *mutex(&names) = vec![OsString::from("a"), OsString::from("b")];
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        runtime
+            .readdir(
+                1,
+                open.fh,
+                0,
+                &mut CollectingSink {
+                    accept_limit: Some(1),
+                    ..Default::default()
+                },
+                &caller,
+            )
+            .unwrap();
+        fail_next.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            runtime.readdir(1, open.fh, 0, &mut CollectingSink::default(), &caller,),
+            Err(Errno::EIO)
+        );
+        let mut resumed = CollectingSink::default();
+        runtime
+            .readdir(1, open.fh, 1, &mut resumed, &caller)
+            .unwrap();
+        assert_eq!(resumed.seen[0].0, OsStr::new("b"));
+    }
+
+    #[test]
+    fn rejected_sink_entry_is_rolled_back() {
+        let recording = RecordingFs::default();
+        let states = Arc::clone(&recording.getattr_states);
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        runtime
+            .readdir(
+                1,
+                open.fh,
+                0,
+                &mut CollectingSink {
+                    accept_limit: Some(0),
+                    ..Default::default()
+                },
+                &caller,
+            )
+            .unwrap();
+
+        let node = found(
+            runtime
+                .lookup(1, OsStr::new("enumerated"), &caller)
+                .unwrap(),
+        );
+        runtime.getattr(node, None, &caller).unwrap();
+        assert_eq!(**mutex(&states).last().unwrap(), 1);
+    }
+
+    #[test]
+    fn dot_entries_use_current_and_parent_identities() {
         let runtime = Runtime::new(PathNodeFs::new(RecordingFs {
-            alternate_dir_identity: true,
+            include_dots: true,
             ..Default::default()
         }));
         let caller = Caller::default();
         let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut sink = CollectingSink::default();
+        runtime.readdir(1, open.fh, 0, &mut sink, &caller).unwrap();
+        assert_eq!(sink.seen[0], (OsString::from("."), NodeId::ROOT, 1));
+        assert_eq!(sink.seen[1], (OsString::from(".."), NodeId::ROOT, 2));
+    }
+
+    #[test]
+    fn directory_lifecycle_receives_the_inner_handle() {
+        let recording = RecordingFs::default();
+        let fsyncdir_handles = Arc::clone(&recording.fsyncdir_handles);
+        let releasedir_handles = Arc::clone(&recording.releasedir_handles);
+        let expected = recording.dir_handle;
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+
+        runtime.fsyncdir(1, open.fh, true, &caller).unwrap();
+        runtime.releasedir(1, open.fh, &caller).unwrap();
+
+        assert_eq!(mutex(&fsyncdir_handles).as_slice(), [expected]);
+        assert_eq!(mutex(&releasedir_handles).as_slice(), [expected]);
+    }
+
+    #[test]
+    fn concurrent_offset_zero_reads_each_get_a_complete_listing() {
+        let barrier = Arc::new(Barrier::new(2));
+        let recording = RecordingFs {
+            directory_names: Arc::new(Mutex::new(vec![OsString::from("a"), OsString::from("b")])),
+            list_barrier: Some(Arc::clone(&barrier)),
+            ..Default::default()
+        };
+        let list_calls = Arc::clone(&recording.list_calls);
+        let runtime = Arc::new(Runtime::new(PathNodeFs::new(recording)));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let runtime = Arc::clone(&runtime);
+                thread::spawn(move || {
+                    let mut sink = CollectingSink::default();
+                    runtime
+                        .readdir(1, open.fh, 0, &mut sink, &Caller::default())
+                        .unwrap();
+                    sink.seen
+                        .into_iter()
+                        .map(|(name, _, offset)| (name, offset))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let mut generations = Vec::new();
+        for worker in workers {
+            let seen = worker.join().unwrap();
+            let (generation, _) = split_cookie(seen[0].1);
+            assert_eq!(
+                seen,
+                vec![
+                    (OsString::from("a"), listing_cookie(generation, 0)),
+                    (OsString::from("b"), listing_cookie(generation, 1)),
+                ]
+            );
+            generations.push(generation);
+        }
+        assert_ne!(generations[0], generations[1]);
+        assert_eq!(list_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn cookies_carry_the_generation_and_stay_below_2_31() {
+        assert_eq!(listing_cookie(0, 0), 1);
+        let largest = listing_cookie(COOKIE_GENERATIONS - 1, MAX_LISTING_LEN - 1);
+        assert!(largest < 1 << 31);
         assert_eq!(
-            runtime.readdir(1, open.fh, 0, &mut AcceptingSink, &caller),
-            Ok(())
+            split_cookie(largest),
+            (COOKIE_GENERATIONS - 1, MAX_LISTING_LEN as u64)
         );
-        assert!(matches!(
-            runtime.lookup(1, OsStr::new("enumerated"), &caller),
-            Ok(LookupReply::Found(_))
-        ));
+        assert_eq!(split_cookie(listing_cookie(5, 41)), (5, 42));
+    }
+
+    #[test]
+    fn listing_generations_wrap_and_only_recent_listings_are_kept() {
+        let mut listings = DirListings::<()>::new();
+        for _ in 0..COOKIE_GENERATIONS {
+            listings.push(0, DirBuffer::new());
+        }
+        assert_eq!(listings.retained.len(), RETAINED_LISTINGS);
+        assert!(listings.get(0).is_none());
+        assert_eq!(
+            listings.current().unwrap().generation,
+            COOKIE_GENERATIONS - 1
+        );
+        assert_eq!(listings.push(0, DirBuffer::new()).generation, 0);
+    }
+
+    #[test]
+    fn interleaved_streams_resume_their_own_listing() {
+        let recording = RecordingFs::default();
+        let names = Arc::clone(&recording.directory_names);
+        let list_calls = Arc::clone(&recording.list_calls);
+        *mutex(&names) = vec![OsString::from("a"), OsString::from("b")];
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+
+        let mut first = CollectingSink {
+            accept_limit: Some(1),
+            ..Default::default()
+        };
+        runtime.readdir(1, open.fh, 0, &mut first, &caller).unwrap();
+        *mutex(&names) = vec![
+            OsString::from("x"),
+            OsString::from("y"),
+            OsString::from("z"),
+        ];
+        let mut second = CollectingSink {
+            accept_limit: Some(1),
+            ..Default::default()
+        };
+        runtime
+            .readdir(1, open.fh, 0, &mut second, &caller)
+            .unwrap();
+
+        let mut first_rest = CollectingSink::default();
+        runtime
+            .readdir(1, open.fh, first.seen[0].2, &mut first_rest, &caller)
+            .unwrap();
+        let mut second_rest = CollectingSink::default();
+        runtime
+            .readdir(1, open.fh, second.seen[0].2, &mut second_rest, &caller)
+            .unwrap();
+
+        let names_of = |sink: &CollectingSink| {
+            sink.seen
+                .iter()
+                .map(|(name, _, _)| name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names_of(&first), [OsStr::new("a")]);
+        assert_eq!(names_of(&first_rest), [OsStr::new("b")]);
+        assert_eq!(names_of(&second), [OsStr::new("x")]);
+        assert_eq!(names_of(&second_rest), [OsStr::new("y"), OsStr::new("z")]);
+        assert_eq!(list_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn evicted_listing_resumes_the_current_one_by_index() {
+        let recording = RecordingFs::default();
+        let names = Arc::clone(&recording.directory_names);
+        *mutex(&names) = vec![OsString::from("a"), OsString::from("b")];
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut first = CollectingSink {
+            accept_limit: Some(1),
+            ..Default::default()
+        };
+        runtime.readdir(1, open.fh, 0, &mut first, &caller).unwrap();
+
+        *mutex(&names) = vec![OsString::from("p"), OsString::from("q")];
+        for _ in 0..RETAINED_LISTINGS {
+            runtime
+                .readdir(1, open.fh, 0, &mut CollectingSink::default(), &caller)
+                .unwrap();
+        }
+        let mut resumed = CollectingSink::default();
+        runtime
+            .readdir(1, open.fh, first.seen[0].2, &mut resumed, &caller)
+            .unwrap();
+
+        assert_eq!(resumed.seen.len(), 1);
+        assert_eq!(resumed.seen[0].0, OsStr::new("q"));
+    }
+
+    #[test]
+    fn entry_unlinked_between_reads_is_not_replayed_or_reinserted() {
+        assert_unlinked_entry_is_not_replayed(RecordingFs::default());
+    }
+
+    #[test]
+    fn entry_whose_lookup_fails_with_enoent_is_not_replayed() {
+        assert_unlinked_entry_is_not_replayed(RecordingFs {
+            removed_lookup_fails: true,
+            ..Default::default()
+        });
+    }
+
+    fn assert_unlinked_entry_is_not_replayed(recording: RecordingFs) {
+        let names = Arc::clone(&recording.directory_names);
+        let states = Arc::clone(&recording.getattr_states);
+        *mutex(&names) = vec![OsString::from("a"), OsString::from("z")];
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut first = CollectingSink {
+            accept_limit: Some(1),
+            ..Default::default()
+        };
+        runtime.readdir(1, open.fh, 0, &mut first, &caller).unwrap();
+
+        runtime.unlink(1, OsStr::new("z"), &caller).unwrap();
+        let mut resumed = CollectingSink::default();
+        runtime
+            .readdir(1, open.fh, first.seen[0].2, &mut resumed, &caller)
+            .unwrap();
+        assert!(resumed.seen.is_empty());
+
+        // A new "z" must get its own state, not the listed one's.
+        let (created, _) = runtime
+            .create(1, OsStr::new("z"), 0o644, 0, 0, &caller)
+            .unwrap();
+        runtime.getattr(created.ino, None, &caller).unwrap();
+        assert!(**mutex(&states).last().unwrap() < 10_000);
+    }
+
+    #[test]
+    fn entry_replaced_between_reads_is_replayed_with_current_attributes() {
+        let recording = RecordingFs::default();
+        let names = Arc::clone(&recording.directory_names);
+        let lookups = Arc::clone(&recording.next_state);
+        *mutex(&names) = vec![OsString::from("a"), OsString::from("b")];
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut first = CollectingPlusSink {
+            accept_limit: Some(1),
+            ..Default::default()
+        };
+        runtime
+            .readdirplus(1, open.fh, 0, &mut first, &caller)
+            .unwrap();
+        let mut unchanged = CollectingPlusSink::default();
+        runtime
+            .readdirplus(1, open.fh, first.seen[0].2, &mut unchanged, &caller)
+            .unwrap();
+        assert_eq!(unchanged.sizes, [0]);
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
+
+        let other = found(runtime.lookup(1, OsStr::new("other"), &caller).unwrap());
+        runtime
+            .rename(1, OsStr::new("other"), 1, OsStr::new("b"), 0, &caller)
+            .unwrap();
+        let mut resumed = CollectingPlusSink::default();
+        runtime
+            .readdirplus(1, open.fh, first.seen[0].2, &mut resumed, &caller)
+            .unwrap();
+
+        assert_eq!(resumed.seen[0].0, OsStr::new("b"));
+        assert_eq!(resumed.seen[0].1, other);
+        assert_eq!(resumed.seen[0].2, first.seen[0].2 + 1);
+        assert_eq!(resumed.sizes, [2]);
+    }
+
+    fn kind_only(names: &[&str]) -> RecordingFs {
+        RecordingFs {
+            kind_only: true,
+            directory_names: Arc::new(Mutex::new(names.iter().map(OsString::from).collect())),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn kind_only_entries_are_looked_up_for_readdirplus() {
+        let recording = kind_only(&["a", "b"]);
+        let lookups = Arc::clone(&recording.next_state);
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut plus = CollectingPlusSink::default();
+
+        runtime
+            .readdirplus(1, open.fh, 0, &mut plus, &caller)
+            .unwrap();
+
+        assert_eq!(plus.sizes, [1, 2]);
+        assert_eq!(lookups.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn kind_only_entry_the_lookup_cannot_find_is_skipped() {
+        let recording = kind_only(&["a", "gone", "c"]);
+        mutex(&recording.removed_names).insert(OsString::from("gone"));
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut plus = CollectingPlusSink::default();
+
+        runtime
+            .readdirplus(1, open.fh, 0, &mut plus, &caller)
+            .unwrap();
+
+        let names: Vec<_> = plus.seen.iter().map(|(name, _, _)| name.clone()).collect();
+        assert_eq!(names, [OsStr::new("a"), OsStr::new("c")]);
+        assert_eq!(plus.seen[1].2, 3);
+    }
+
+    #[test]
+    fn basic_readdir_of_kind_only_entries_makes_no_lookups() {
+        let recording = kind_only(&["a", "b"]);
+        let lookups = Arc::clone(&recording.next_state);
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut sink = CollectingSink::default();
+
+        runtime.readdir(1, open.fh, 0, &mut sink, &caller).unwrap();
+
+        assert_eq!(sink.seen.len(), 2);
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn plus_lookup_error_ends_the_page_and_fails_the_next_read() {
+        let recording = kind_only(&["a", "b", "c"]);
+        let failing = Arc::clone(&recording.failing_lookups);
+        let list_calls = Arc::clone(&recording.list_calls);
+        mutex(&failing).insert(OsString::from("b"));
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+
+        let mut first = CollectingPlusSink::default();
+        runtime
+            .readdirplus(1, open.fh, 0, &mut first, &caller)
+            .unwrap();
+        assert_eq!(first.seen.len(), 1);
+        assert_eq!(first.seen[0].0, OsStr::new("a"));
+        let resume = first.seen[0].2;
+        assert_eq!(
+            runtime.readdirplus(
+                1,
+                open.fh,
+                resume,
+                &mut CollectingPlusSink::default(),
+                &caller
+            ),
+            Err(Errno::EIO)
+        );
+
+        // The failed read keeps the listing, so a retry resumes it.
+        mutex(&failing).clear();
+        let mut retried = CollectingPlusSink::default();
+        runtime
+            .readdirplus(1, open.fh, resume, &mut retried, &caller)
+            .unwrap();
+        let names: Vec<_> = retried
+            .seen
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect();
+        assert_eq!(names, [OsStr::new("b"), OsStr::new("c")]);
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn plus_lookup_error_on_the_first_entry_fails_the_read() {
+        let recording = kind_only(&["a", "b"]);
+        mutex(&recording.failing_lookups).insert(OsString::from("a"));
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+
+        assert_eq!(
+            runtime.readdirplus(1, open.fh, 0, &mut CollectingPlusSink::default(), &caller),
+            Err(Errno::EIO)
+        );
+    }
+
+    #[test]
+    fn empty_read_at_the_end_releases_the_listing() {
+        let recording = RecordingFs::default();
+        let names = Arc::clone(&recording.directory_names);
+        let list_calls = Arc::clone(&recording.list_calls);
+        *mutex(&names) = vec![OsString::from("a"), OsString::from("b")];
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut all = CollectingSink::default();
+        runtime.readdir(1, open.fh, 0, &mut all, &caller).unwrap();
+        let end = all.seen[1].2;
+
+        let mut empty = CollectingSink::default();
+        runtime
+            .readdir(1, open.fh, end, &mut empty, &caller)
+            .unwrap();
+        assert!(empty.seen.is_empty());
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
+
+        // With no listing left, resuming lists the directory again.
+        let mut resumed = CollectingSink::default();
+        runtime
+            .readdir(1, open.fh, all.seen[0].2, &mut resumed, &caller)
+            .unwrap();
+        assert_eq!(resumed.seen[0].0, OsStr::new("b"));
+        assert_eq!(list_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn repeated_empty_reads_at_the_end_do_not_list_again() {
+        let recording = RecordingFs::default();
+        let names = Arc::clone(&recording.directory_names);
+        let list_calls = Arc::clone(&recording.list_calls);
+        *mutex(&names) = vec![OsString::from("a"), OsString::from("b")];
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut all = CollectingSink::default();
+        runtime.readdir(1, open.fh, 0, &mut all, &caller).unwrap();
+        let end = all.seen[1].2;
+        *mutex(&names) = vec![
+            OsString::from("a"),
+            OsString::from("b"),
+            OsString::from("c"),
+        ];
+
+        for _ in 0..2 {
+            let mut empty = CollectingSink::default();
+            runtime
+                .readdir(1, open.fh, end, &mut empty, &caller)
+                .unwrap();
+            assert!(empty.seen.is_empty());
+        }
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stream_ended_by_skipped_entries_stays_ended() {
+        let recording = RecordingFs::default();
+        let names = Arc::clone(&recording.directory_names);
+        let list_calls = Arc::clone(&recording.list_calls);
+        *mutex(&names) = vec![
+            OsString::from("a"),
+            OsString::from("x"),
+            OsString::from("y"),
+        ];
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut first = CollectingSink {
+            accept_limit: Some(1),
+            ..Default::default()
+        };
+        runtime.readdir(1, open.fh, 0, &mut first, &caller).unwrap();
+        runtime.unlink(1, OsStr::new("x"), &caller).unwrap();
+        runtime.unlink(1, OsStr::new("y"), &caller).unwrap();
+
+        for _ in 0..2 {
+            let mut empty = CollectingSink::default();
+            runtime
+                .readdir(1, open.fh, first.seen[0].2, &mut empty, &caller)
+                .unwrap();
+            assert!(empty.seen.is_empty());
+        }
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn empty_read_through_the_fallback_keeps_the_current_listing() {
+        let recording = RecordingFs::default();
+        let names = Arc::clone(&recording.directory_names);
+        let list_calls = Arc::clone(&recording.list_calls);
+        *mutex(&names) = vec![
+            OsString::from("a"),
+            OsString::from("b"),
+            OsString::from("c"),
+        ];
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut evicted = CollectingSink::default();
+        runtime
+            .readdir(1, open.fh, 0, &mut evicted, &caller)
+            .unwrap();
+        let evicted_end = evicted.seen[2].2;
+
+        *mutex(&names) = vec![OsString::from("p"), OsString::from("q")];
+        for _ in 1..RETAINED_LISTINGS {
+            runtime
+                .readdir(1, open.fh, 0, &mut CollectingSink::default(), &caller)
+                .unwrap();
+        }
+        *mutex(&names) = vec![OsString::from("r"), OsString::from("s")];
+        let mut current = CollectingSink {
+            accept_limit: Some(1),
+            ..Default::default()
+        };
+        runtime
+            .readdir(1, open.fh, 0, &mut current, &caller)
+            .unwrap();
+        let calls = list_calls.load(Ordering::SeqCst);
+
+        // The evicted stream's end is past the current listing's end, so
+        // its read borrows the current listing and sends nothing.
+        let mut empty = CollectingSink::default();
+        runtime
+            .readdir(1, open.fh, evicted_end, &mut empty, &caller)
+            .unwrap();
+        assert!(empty.seen.is_empty());
+
+        let mut resumed = CollectingSink::default();
+        runtime
+            .readdir(1, open.fh, current.seen[0].2, &mut resumed, &caller)
+            .unwrap();
+        assert_eq!(resumed.seen.len(), 1);
+        assert_eq!(resumed.seen[0].0, OsStr::new("s"));
+        assert_eq!(list_calls.load(Ordering::SeqCst), calls);
     }
 
     #[derive(Default)]
@@ -2226,18 +3198,19 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingPlusDirSink {
-        seen: Vec<(OsString, u64)>,
+        seen: Vec<(OsString, u64, bool)>,
     }
 
     impl PathPlusDirSink<()> for RecordingPlusDirSink {
         fn add(
             &mut self,
             name: &OsStr,
-            _attr: NodeAttr,
+            attr: Option<NodeAttr>,
             _identity: PathDirIdentity<()>,
             next_offset: u64,
         ) -> bool {
-            self.seen.push((name.to_os_string(), next_offset));
+            self.seen
+                .push((name.to_os_string(), next_offset, attr.is_some()));
             true
         }
     }
@@ -2245,18 +3218,8 @@ mod tests {
     fn sample_dir_buffer() -> DirBuffer<()> {
         let mut buf = DirBuffer::new();
         buf.push_dots(NodeAttr::default(), NodeAttr::default());
-        buf.push(
-            "a",
-            FileKind::RegularFile,
-            NodeAttr::default(),
-            Arc::new(()),
-        );
-        buf.push(
-            "b",
-            FileKind::RegularFile,
-            NodeAttr::default(),
-            Arc::new(()),
-        );
+        buf.push_plus("a", NodeAttr::default(), Arc::new(()));
+        buf.push("b", FileKind::RegularFile, Arc::new(()));
         buf
     }
 
@@ -2308,6 +3271,7 @@ mod tests {
         let mut sink = RecordingPlusDirSink::default();
         buf.fill_plus(0, &mut sink);
         assert_eq!(sink.seen.len(), 4);
-        assert_eq!(sink.seen[3], (OsString::from("b"), 4));
+        assert_eq!(sink.seen[2], (OsString::from("a"), 3, true));
+        assert_eq!(sink.seen[3], (OsString::from("b"), 4, false));
     }
 }
