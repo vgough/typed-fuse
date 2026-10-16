@@ -1065,11 +1065,11 @@ impl MountOption {
                     dropped("nonempty")
                 }
             }
-            MountOption::FsName(name) => Some(format!("fsname={name}")),
-            MountOption::Subtype(name) => Some(format!("subtype={name}")),
+            MountOption::FsName(name) => Some(format!("fsname={}", escape_option_value(name))),
+            MountOption::Subtype(name) => Some(format!("subtype={}", escape_option_value(name))),
             MountOption::VolName(name) => {
                 if cfg!(target_os = "macos") {
-                    Some(format!("volname={name}"))
+                    Some(format!("volname={}", escape_option_value(name)))
                 } else {
                     dropped(&format!("volname={name}"))
                 }
@@ -1077,6 +1077,20 @@ impl MountOption {
             MountOption::Custom(opt) => Some(opt.clone()),
         }
     }
+}
+
+/// Escapes a mount option value for libfuse's `-o` parser, which splits
+/// the option list on `,` and treats `\` as an escape, so a value such as
+/// a path containing a comma reaches the kernel intact.
+fn escape_option_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, ',' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 // ---------------------------------------------------------------------
@@ -1543,6 +1557,27 @@ mod tests {
         assert_eq!(
             MountOption::Custom("noatime".to_string()).render().unwrap(),
             "noatime"
+        );
+    }
+
+    #[test]
+    fn mount_option_render_escapes_values() {
+        assert_eq!(
+            MountOption::FsName(r"/data/a,b\c d".to_string())
+                .render()
+                .unwrap(),
+            r"fsname=/data/a\,b\\c d"
+        );
+        assert_eq!(
+            MountOption::Subtype("my,fs".to_string()).render().unwrap(),
+            r"subtype=my\,fs"
+        );
+        // Raw words are the caller's own option syntax and pass unchanged.
+        assert_eq!(
+            MountOption::Custom(r"opt=a\,b".to_string())
+                .render()
+                .unwrap(),
+            r"opt=a\,b"
         );
     }
 

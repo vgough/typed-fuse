@@ -14,7 +14,11 @@ use std::path::Path;
 
 /// Mount settings for a `PathFilesystem`-based daemon.
 pub struct MountConfig {
+    /// The mount source shown in the mount table (`fsname=`).
     pub fs_name: String,
+    /// Filesystem type suffix (`subtype=`): Linux and FreeBSD report the
+    /// mount's type as `fuse.<subtype>` / `fusefs.<subtype>`.
+    pub subtype: Option<String>,
     pub allow_other: bool,
     pub allow_root: bool,
     pub default_permissions: bool,
@@ -32,6 +36,7 @@ impl MountConfig {
     pub fn new(fs_name: impl Into<String>) -> Self {
         Self {
             fs_name: fs_name.into(),
+            subtype: None,
             allow_other: false,
             allow_root: false,
             default_permissions: true,
@@ -50,8 +55,25 @@ impl MountConfig {
     /// `ro`/`rw` are handled symmetrically: they toggle `read_only` rather
     /// than passing through, so a later `rw` undoes an earlier `ro` the way
     /// libfuse's own option parser would.
+    ///
+    /// `fsname=`, `subtype=` and `volname=` replace the corresponding field
+    /// rather than adding a second word, which libfuse would not reliably
+    /// honor (macFUSE keeps the first `fsname=`). Their values are taken
+    /// unescaped; [`build_mount_options`]' rendering escapes them.
     pub fn parse_option_words<'a>(&mut self, words: impl IntoIterator<Item = &'a str>) {
         for word in words {
+            if let Some(name) = word.strip_prefix("fsname=") {
+                self.fs_name = name.to_string();
+                continue;
+            }
+            if let Some(name) = word.strip_prefix("subtype=") {
+                self.subtype = Some(name.to_string());
+                continue;
+            }
+            if let Some(name) = word.strip_prefix("volname=") {
+                self.volname = Some(name.to_string());
+                continue;
+            }
             match word {
                 "allow_other" => self.allow_other = true,
                 "allow_root" => self.allow_root = true,
@@ -68,6 +90,9 @@ impl MountConfig {
 /// Renders a [`MountConfig`] to the [`MountOption`] list `Session` expects.
 pub fn build_mount_options(cfg: &MountConfig) -> Vec<MountOption> {
     let mut options = vec![MountOption::FsName(cfg.fs_name.clone())];
+    if let Some(subtype) = &cfg.subtype {
+        options.push(MountOption::Subtype(subtype.clone()));
+    }
     // `uid=`/`gid=` are high-level libfuse mount options (handled by
     // `fuse_main`'s uid/gid translation layer); the low-level session API
     // used here doesn't recognize them and libfuse rejects the mount with
@@ -141,6 +166,7 @@ mod tests {
     fn preserves_mount_policy_and_passthrough_options() {
         let mut config = MountConfig {
             fs_name: "encfs-test".to_string(),
+            subtype: Some("encfs".to_string()),
             allow_other: true,
             allow_root: true,
             default_permissions: true,
@@ -153,6 +179,7 @@ mod tests {
 
         let options = build_mount_options(&config);
         assert!(options.contains(&MountOption::FsName("encfs-test".to_string())));
+        assert!(options.contains(&MountOption::Subtype("encfs".to_string())));
         assert!(options.contains(&MountOption::AllowOther));
         assert!(options.contains(&MountOption::AllowRoot));
         assert!(options.contains(&MountOption::DefaultPermissions));
@@ -175,6 +202,34 @@ mod tests {
         assert!(config.nonempty);
         assert!(config.read_only);
         assert_eq!(config.extra_options, vec!["noatime".to_string()]);
+    }
+
+    #[test]
+    fn subtype_is_omitted_by_default() {
+        let options = build_mount_options(&MountConfig::new("fs"));
+        assert!(
+            !options
+                .iter()
+                .any(|option| matches!(option, MountOption::Subtype(_)))
+        );
+    }
+
+    #[test]
+    fn parse_option_words_replaces_named_values() {
+        let mut config = MountConfig::new("default");
+        config.parse_option_words(["fsname=/data/a,b", "subtype=myfs", "volname=Vol"]);
+        config.parse_option_words(["fsname=/data/c"]);
+        assert_eq!(config.fs_name, "/data/c");
+        assert_eq!(config.subtype.as_deref(), Some("myfs"));
+        assert_eq!(config.volname.as_deref(), Some("Vol"));
+        assert!(config.extra_options.is_empty());
+
+        let options = build_mount_options(&config);
+        let fs_names = options
+            .iter()
+            .filter(|option| matches!(option, MountOption::FsName(_)))
+            .count();
+        assert_eq!(fs_names, 1);
     }
 
     #[test]
