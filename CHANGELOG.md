@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- `set_ownership_fd` and `set_ownership_path` now compare the caller with
+  the process's effective uid and gid, the ids a new entry gets, instead of
+  the real ones. Under a setuid or setgid launcher they used to skip a needed
+  ownership change, or make an unneeded one.
+
+### Other changes
+
+- New `passthrough::rename_noreplace_at`, a rename that fails with `EEXIST`
+  instead of replacing an existing entry: `renameat2(RENAME_NOREPLACE)` on
+  Linux (through `syscall(2)`, so any C library works),
+  `renameatx_np(RENAME_EXCL)` on macOS, and `renameat2(AT_RENAME_NOREPLACE)`
+  on FreeBSD 15, looked up at run time so binaries still run on FreeBSD 14.
+  It returns `Ok(false)` where the platform or filesystem can't refuse to
+  replace, so callers can fall back to a locked check and rename.
+
 ## 0.8.0
 
 ### Breaking changes

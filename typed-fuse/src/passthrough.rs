@@ -681,13 +681,20 @@ pub fn utimens_permission_check(
     Err(Errno::EPERM)
 }
 
+/// Whether an entry this process creates already has `caller`'s ownership:
+/// the kernel gives new entries the process's effective uid and gid, not the
+/// real ones (which differ under a setuid or setgid launcher).
+fn owned_by_caller(caller: &Caller) -> bool {
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    caller.uid == uid && caller.gid == gid
+}
+
 /// Set ownership of an open file descriptor to the caller's uid/gid when it
-/// differs from the current process. Skips the `fchown` when already correct
-/// and ignores `EPERM` so unprivileged mounts continue to work.
+/// differs from the current process's effective ids, which a new entry gets.
+/// Skips the `fchown` when already correct and ignores `EPERM` so
+/// unprivileged mounts continue to work.
 pub fn set_ownership_fd(fd: RawFd, caller: &Caller) -> Result<(), Errno> {
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-    if caller.uid == uid && caller.gid == gid {
+    if owned_by_caller(caller) {
         return Ok(());
     }
     if unsafe { libc::fchown(fd, caller.uid as libc::uid_t, caller.gid as libc::gid_t) } == -1 {
@@ -700,12 +707,11 @@ pub fn set_ownership_fd(fd: RawFd, caller: &Caller) -> Result<(), Errno> {
 }
 
 /// Set ownership of a path to the caller's uid/gid when it differs from the
-/// current process. Skips the `chown` when already correct and ignores
-/// `EPERM` so unprivileged mounts continue to work.
+/// current process's effective ids, which a new entry gets. Skips the
+/// `chown` when already correct and ignores `EPERM` so unprivileged mounts
+/// continue to work.
 pub fn set_ownership_path(path: &Path, caller: &Caller) -> Result<(), Errno> {
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-    if caller.uid == uid && caller.gid == gid {
+    if owned_by_caller(caller) {
         return Ok(());
     }
     let c_path = c_path(path)?;
@@ -874,9 +880,172 @@ pub fn symlink(target: &OsStr, link: &Path) -> Result<(), Errno> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Renames
+// ---------------------------------------------------------------------------
+
+/// Rename `from` (relative to `fromfd`) to `to` (relative to `tofd`), but
+/// only if nothing is at `to`: unlike rename(2), which replaces an existing
+/// file or empty directory, this fails with `EEXIST`. The check and the
+/// rename are one atomic step.
+///
+/// Returns `Ok(true)` once renamed, and `Ok(false)`, having done nothing,
+/// where the platform or the filesystem can't refuse to replace: the caller
+/// then needs a fallback of its own, such as a check and rename(2) under a
+/// lock. `fromfd` and `tofd` may be `libc::AT_FDCWD`.
+///
+/// - Linux: `renameat2(RENAME_NOREPLACE)`, called through `syscall(2)` so it
+///   needs no particular C library version. A kernel before 3.15 answers
+///   `ENOSYS`, a filesystem without the flag `EINVAL`.
+/// - macOS: `renameatx_np(RENAME_EXCL)`. A filesystem without it answers
+///   `ENOTSUP`.
+/// - FreeBSD: `renameat2(AT_RENAME_NOREPLACE)`, new in FreeBSD 15. It is
+///   looked up at run time, so the same binary runs on FreeBSD 14, where
+///   this returns `Ok(false)`.
+///
+/// Those answers, and `EINVAL` generally, count as unsupported. A rename
+/// that is invalid for another reason, such as a directory into itself,
+/// then gets its error from the fallback instead.
+pub fn rename_noreplace_at(
+    fromfd: RawFd,
+    from: &CStr,
+    tofd: RawFd,
+    to: &CStr,
+) -> Result<bool, Errno> {
+    let Some(ret) = noreplace::renameat(fromfd, from, tofd, to) else {
+        return Ok(false);
+    };
+    if ret == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    let unsupported = [libc::EINVAL, libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP];
+    match err.raw_os_error() {
+        Some(n) if unsupported.contains(&n) => Ok(false),
+        _ => Err(err.into()),
+    }
+}
+
+/// The platform's no-replace rename, returning its result (0 or -1 with
+/// `errno`), or `None` where there is none.
+mod noreplace {
+    use std::ffi::CStr;
+    use std::os::unix::io::RawFd;
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn renameat(fromfd: RawFd, from: &CStr, tofd: RawFd, to: &CStr) -> Option<i32> {
+        // SAFETY: both names are valid C strings for the duration of the call.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                fromfd,
+                from.as_ptr(),
+                tofd,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        Some(ret as i32)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn renameat(fromfd: RawFd, from: &CStr, tofd: RawFd, to: &CStr) -> Option<i32> {
+        // SAFETY: both names are valid C strings for the duration of the call.
+        Some(unsafe {
+            libc::renameatx_np(fromfd, from.as_ptr(), tofd, to.as_ptr(), libc::RENAME_EXCL)
+        })
+    }
+
+    #[cfg(target_os = "freebsd")]
+    pub(super) fn renameat(fromfd: RawFd, from: &CStr, tofd: RawFd, to: &CStr) -> Option<i32> {
+        use std::sync::OnceLock;
+        type Renameat2 = unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_uint,
+        ) -> libc::c_int;
+        // Linking `renameat2` directly would keep the binary from loading on
+        // FreeBSD 14, whose libc lacks it.
+        static RENAMEAT2: OnceLock<Option<Renameat2>> = OnceLock::new();
+        let renameat2 = (*RENAMEAT2.get_or_init(|| {
+            // `RTLD_DEFAULT`, which the libc crate doesn't define for FreeBSD.
+            let default = -2isize as *mut libc::c_void;
+            // SAFETY: the name is a valid C string.
+            let sym = unsafe { libc::dlsym(default, c"renameat2".as_ptr()) };
+            // SAFETY: FreeBSD 15 declares `renameat2` with this signature.
+            (!sym.is_null())
+                .then(|| unsafe { std::mem::transmute::<*mut libc::c_void, Renameat2>(sym) })
+        }))?;
+        // SAFETY: both names are valid C strings for the duration of the call.
+        Some(unsafe {
+            renameat2(
+                fromfd,
+                from.as_ptr(),
+                tofd,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+    pub(super) fn renameat(_: RawFd, _: &CStr, _: RawFd, _: &CStr) -> Option<i32> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An existing entry, a file or an empty directory, is never replaced; a
+    /// free name is renamed to. Linux and macOS test filesystems support it;
+    /// FreeBSD 14 doesn't, and then nothing at all is renamed.
+    #[test]
+    fn rename_noreplace_never_replaces() {
+        use std::os::unix::io::AsRawFd;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("from")).unwrap();
+        std::fs::create_dir(root.join("empty")).unwrap();
+        std::fs::write(root.join("file"), b"kept").unwrap();
+        let dir = std::fs::File::open(root).unwrap();
+        let fd = dir.as_raw_fd();
+        let supported = rename_noreplace_at(fd, c"from", fd, c"to").unwrap();
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(supported);
+        }
+        let from = if supported { c"to" } else { c"from" };
+        assert!(root.join(from.to_str().unwrap()).is_dir());
+
+        for existing in [c"empty", c"file"] {
+            let result = rename_noreplace_at(fd, from, fd, existing);
+            if supported {
+                assert_eq!(result, Err(Errno::EEXIST), "{existing:?}");
+            } else {
+                assert_eq!(result, Ok(false), "{existing:?}");
+            }
+        }
+        assert!(root.join(from.to_str().unwrap()).is_dir());
+        assert!(root.join("empty").is_dir());
+        assert_eq!(std::fs::read(root.join("file")).unwrap(), b"kept");
+    }
+
+    /// A caller with the process's effective ids needs no ownership change,
+    /// so none is attempted: a chown of this missing path would fail.
+    #[test]
+    fn set_ownership_skips_a_caller_with_the_effective_ids() {
+        let caller = Caller {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            pid: 0,
+            umask: 0,
+        };
+        assert!(owned_by_caller(&caller));
+        set_ownership_path(Path::new("/nonexistent/typed-fuse"), &caller).unwrap();
+    }
 
     #[test]
     fn system_time_preserves_fractional_pre_epoch_timestamp() {

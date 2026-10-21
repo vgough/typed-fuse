@@ -434,8 +434,10 @@ a backing Unix tree:
 - no-follow set/get/list/remove xattr wrappers for Linux and macOS;
 - byte-preserving `Path`/`OsStr` to `CString` conversion;
 - access and timestamp-permission checks;
-- ownership, chmod/chown, and timestamp mutation by fd or path; and
-- portable special-node and arbitrary-byte symlink creation.
+- ownership, chmod/chown, and timestamp mutation by fd or path;
+- portable special-node and arbitrary-byte symlink creation; and
+- a rename that never replaces an existing entry, where the platform and
+  filesystem support one.
 
 Use these helpers instead of duplicating platform-specific libc calls in a filesystem crate. Their
 APIs return `Errno`, matching trait callbacks directly.
