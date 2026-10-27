@@ -11,8 +11,8 @@ categories = ["filesystem"]
 edition = "2024"
 
 [dependencies]
-libfuse-sys = { path = "../libfuse-sys", default-features = false, features = ["fuse_lowlevel", "fuse_312"] }
-typed-fuse-core = { path = "../typed-fuse-core" }
+libfuse-sys = { package = "typed-fuse-sys", version = "0.6.0", path = "../libfuse-sys", default-features = false, features = ["fuse_lowlevel", "fuse_312"] }
+typed-fuse-core = { version = "0.7.0", path = "../typed-fuse-core" }
 libc = "0.2"
 log = "0.4"
 

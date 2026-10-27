@@ -5,7 +5,7 @@
 //! Usage: `cargo run --example hello_ll_raw -- <mountpoint>`
 
 mod imp {
-    use libfuse_sys::fuse_lowlevel::*;
+    use typed_fuse_sys::fuse_lowlevel::*;
     use std::ffi::{CStr, CString};
     use std::mem::size_of;
     use std::os::raw::{c_char, c_int, c_void};
@@ -40,7 +40,7 @@ mod imp {
     // them (via an asm symbol rename) to `<name>$DARWIN` and switches their argument
     // structs to the extended Darwin layouts. This example sticks to the portable
     // vanilla structs, so bind directly to the plain symbol names instead of going
-    // through libfuse_sys's aliased declarations.
+    // through typed_fuse_sys's aliased declarations.
     #[cfg(target_os = "macos")]
     unsafe extern "C" {
         #[link_name = "fuse_reply_entry"]

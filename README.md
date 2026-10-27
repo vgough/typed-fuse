@@ -5,14 +5,14 @@ A safe, Rust-friendly FUSE API built on top of `libfuse-sys`.
 This repository is a workspace containing the following crates:
 * **[`typed-fuse`](typed-fuse/)**: A safe, high-level wrapper over the low-level FUSE 3.x API.
 * **[`typed-fuse-core`](typed-fuse-core/)**: A backend-neutral, node-tracking core for building FUSE filesystems.
-* **[`libfuse-sys`](libfuse-sys/)**: Raw FFI bindings to libfuse. 
+* **[`libfuse-sys`](libfuse-sys/)**: Raw FFI bindings to libfuse, published on crates.io as `typed-fuse-sys`. 
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the end-to-end request flow, API contracts,
 node and handle lifetime rules, path adapter design, and contributor-oriented code map.
 
 ## Acknowledgments
 
-This project started as a fork of the excellent [libfuse-sys](https://github.com/richard-w/libfuse-sys) crate by Richard Wiedenhöft, before expanding to include higher-level, safe abstractions for building filesystems. The raw FFI bindings remain in the `libfuse-sys` sub-crate.
+This project started as a fork of the excellent [libfuse-sys](https://github.com/richard-w/libfuse-sys) crate by Richard Wiedenhöft, before expanding to include higher-level, safe abstractions for building filesystems. The raw FFI bindings remain in the `libfuse-sys` sub-crate, published on crates.io as `typed-fuse-sys` since the `libfuse-sys` name belongs to upstream.
 
 ### Changes to `libfuse-sys` vs Upstream
 
@@ -66,10 +66,11 @@ See `typed-fuse/README.md` for details and `typed-fuse/examples/hello_ll.rs` for
 
 ## Using `libfuse-sys` directly
 
-If you only need the raw bindings, add the dependency to your `Cargo.toml`:
+If you only need the raw bindings, add the `typed-fuse-sys` crate to your `Cargo.toml` and import it as
+`typed_fuse_sys`:
 ```toml
 [dependencies]
-libfuse-sys = { version = "0.4", features = ["fuse_312"] }
+typed-fuse-sys = { version = "0.6", features = ["fuse_312"] }
 libc = "0.2"
 ```
 You can select a FUSE API version. Currently supported are:
