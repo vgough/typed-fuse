@@ -465,7 +465,7 @@ impl<F: NodeFs> Runtime<F> {
     }
     pub fn getattr(&self, ino: u64, fh: Option<u64>, caller: &Caller) -> Result<NodeAttr, Errno> {
         let n = self.node(ino)?;
-        let h = fh.map(|fh| self.file(ino, fh)).transpose()?;
+        let h = self.optional_file(ino, &n, fh)?;
         self.fs.getattr(&n, h.as_deref(), caller)
     }
     pub fn setattr(
@@ -476,7 +476,7 @@ impl<F: NodeFs> Runtime<F> {
         caller: &Caller,
     ) -> Result<NodeAttr, Errno> {
         let n = self.node(ino)?;
-        let h = fh.map(|fh| self.file(ino, fh)).transpose()?;
+        let h = self.optional_file(ino, &n, fh)?;
         self.fs.setattr(&n, h.as_deref(), set, caller)
     }
     pub fn readlink(&self, ino: u64, caller: &Caller) -> Result<PathBuf, Errno> {
@@ -540,6 +540,36 @@ impl<F: NodeFs> Runtime<F> {
             return Err(Errno::EBADF);
         }
         record.acquire().ok_or(Errno::EBADF)
+    }
+    /// Leases the file handle `getattr` or `setattr` should pass for `ino`:
+    /// the one `fh` names, or else, if the filesystem
+    /// [wants one](NodeFs::wants_fallback_handle), the handle most recently
+    /// opened on `ino`.
+    fn optional_file(
+        &self,
+        ino: u64,
+        node: &F::Node,
+        fh: Option<u64>,
+    ) -> Result<Option<HandleLease<F::Handle>>, Errno> {
+        if let Some(fh) = fh {
+            return self.file(ino, fh).map(Some);
+        }
+        // `opens` also counts directory handles, so it only rules out the
+        // scan. The table lock is released before calling the filesystem,
+        // which may take its own locks.
+        let open = lock(&self.shared.table)
+            .map
+            .get(&ino)
+            .is_some_and(|slot| slot.opens > 0);
+        if !open || !self.fs.wants_fallback_handle(node) {
+            return Ok(None);
+        }
+        Ok(lock(&self.handles)
+            .files
+            .values()
+            .rev()
+            .filter(|record| record.node.ino() == ino)
+            .find_map(HandleRecord::acquire))
     }
     fn dir(&self, ino: u64, fh: u64) -> Result<HandleLease<F::DirHandle>, Errno> {
         let record = lock(&self.handles)
@@ -1138,6 +1168,113 @@ mod tests {
         );
         assert_eq!(rt.release(1, open.fh, &caller()).unwrap_err(), Errno::EBADF);
         rt.release(entry.ino, open.fh, &caller()).unwrap();
+    }
+
+    #[derive(Default)]
+    struct HandleFallbackFs {
+        wants_fallback: bool,
+        next_handle: AtomicUsize,
+        getattr_handles: Mutex<Vec<Option<usize>>>,
+        setattr_handles: Mutex<Vec<Option<usize>>>,
+    }
+    impl NodeFs for HandleFallbackFs {
+        type Node = ();
+        type Handle = usize;
+        type DirHandle = ();
+
+        fn root(&mut self) {}
+        fn populate(&mut self, cx: &Cx<'_, ()>) {
+            cx.insert((), NodeId::ROOT);
+            cx.insert((), NodeId::ROOT);
+        }
+        fn getattr(&self, _: &(), handle: Option<&usize>, _: &Caller) -> Result<NodeAttr, Errno> {
+            lock(&self.getattr_handles).push(handle.copied());
+            Ok(NodeAttr::default())
+        }
+        fn setattr(
+            &self,
+            _: &(),
+            handle: Option<&usize>,
+            _: &SetAttr,
+            _: &Caller,
+        ) -> Result<NodeAttr, Errno> {
+            lock(&self.setattr_handles).push(handle.copied());
+            Ok(NodeAttr::default())
+        }
+        fn wants_fallback_handle(&self, _: &()) -> bool {
+            self.wants_fallback
+        }
+        fn open(&self, _: &(), _: i32, _: &Caller) -> Result<Opened<usize>, Errno> {
+            let id = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(Opened::new(id))
+        }
+        fn opendir(&self, _: &(), _: i32, _: &Caller) -> Result<Opened<()>, Errno> {
+            Ok(Opened::new(()))
+        }
+    }
+
+    #[test]
+    fn getattr_and_setattr_without_fh_get_no_handle_by_default() {
+        let rt = Runtime::new(HandleFallbackFs::default());
+        let open = rt.open(2, 0, &caller()).unwrap();
+        rt.getattr(2, None, &caller()).unwrap();
+        rt.setattr(2, None, &SetAttr::default(), &caller()).unwrap();
+        rt.getattr(2, Some(open.fh), &caller()).unwrap();
+        rt.release(2, open.fh, &caller()).unwrap();
+
+        assert_eq!(*lock(&rt.fs.getattr_handles), vec![None, Some(1)]);
+        assert_eq!(*lock(&rt.fs.setattr_handles), vec![None]);
+    }
+
+    #[test]
+    fn getattr_and_setattr_fall_back_to_newest_open_file_handle() {
+        let rt = Runtime::new(HandleFallbackFs {
+            wants_fallback: true,
+            ..HandleFallbackFs::default()
+        });
+        let set = SetAttr::default();
+
+        // No open handles yet -> None.
+        rt.getattr(2, None, &caller()).unwrap();
+        rt.setattr(2, None, &set, &caller()).unwrap();
+
+        // An open directory handle on node 2 does not supply a file handle.
+        let dir = rt.opendir(2, 0, &caller()).unwrap();
+        rt.getattr(2, None, &caller()).unwrap();
+        rt.releasedir(2, dir.fh, &caller()).unwrap();
+
+        // An open file handle on node 3 is never supplied for node 2.
+        let other = rt.open(3, 0, &caller()).unwrap();
+        rt.getattr(2, None, &caller()).unwrap();
+
+        // Opening two handles on node 2 supplies the newer one when fh is None,
+        // while an explicit fh still selects the requested handle.
+        let first = rt.open(2, 0, &caller()).unwrap();
+        let second = rt.open(2, 0, &caller()).unwrap();
+        rt.getattr(2, None, &caller()).unwrap();
+        rt.setattr(2, None, &set, &caller()).unwrap();
+        rt.getattr(2, Some(first.fh), &caller()).unwrap();
+        rt.setattr(2, Some(first.fh), &set, &caller()).unwrap();
+
+        // Releasing the newer handle falls back to the remaining older handle.
+        rt.release(2, second.fh, &caller()).unwrap();
+        rt.getattr(2, None, &caller()).unwrap();
+        rt.setattr(2, None, &set, &caller()).unwrap();
+
+        // Releasing the last handle on node 2 returns to None.
+        rt.release(2, first.fh, &caller()).unwrap();
+        rt.getattr(2, None, &caller()).unwrap();
+        rt.setattr(2, None, &set, &caller()).unwrap();
+        rt.release(3, other.fh, &caller()).unwrap();
+
+        assert_eq!(
+            *lock(&rt.fs.getattr_handles),
+            vec![None, None, None, Some(3), Some(2), Some(2), None]
+        );
+        assert_eq!(
+            *lock(&rt.fs.setattr_handles),
+            vec![None, Some(3), Some(2), Some(2), None]
+        );
     }
 
     struct PlusFs {

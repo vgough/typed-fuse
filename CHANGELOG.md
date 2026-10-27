@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- `PathFilesystem::getattr` and `setattr` on an open file whose last name
+  has been unlinked now receive one of the file's open handles even when
+  the kernel sends none (`fchmod`, `fchown`, `futimens` and most `fstat`
+  calls), instead of `path == None` and `handle == None` with nothing to
+  act on. The handle is the one most recently opened on the file that is
+  still open; it may belong to another process and have been opened with
+  different flags, so it does not prove the caller's access. Files that
+  still have a name get `handle == None` as before.
+
+### Other changes
+
+- New `NodeFs::wants_fallback_handle`, defaulting to `false`. A `NodeFs`
+  that returns `true` for an open node gets one of the node's open file
+  handles in `getattr` and `setattr` when the kernel sends none.
+  `PathNodeFs` returns `true` for open nodes that have lost their last name.
+
 ## 0.8.1
 
 ### Fixes

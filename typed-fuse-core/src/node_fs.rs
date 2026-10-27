@@ -310,8 +310,10 @@ pub trait NodeFs: Sized + Send + Sync {
     fn forget(&self, node: &Self::Node) {}
 
     /// Returns the attributes of `node`, including its current link count.
-    /// `handle` is the open file/dir handle if the call arrived through one,
-    /// or `None` (e.g. an `fstat` on a path rather than a descriptor).
+    /// `handle` is the open file handle if the call arrived through one,
+    /// or `None` (e.g. an `fstat` on a path rather than a descriptor). See
+    /// [`wants_fallback_handle`](NodeFs::wants_fallback_handle) for when the
+    /// runtime supplies a handle the kernel did not name.
     fn getattr(
         &self,
         node: &Self::Node,
@@ -330,7 +332,8 @@ pub trait NodeFs: Sized + Send + Sync {
 
     /// Applies the `Some` fields of `set` to `node`, returning the resulting
     /// attributes. `handle` is the open handle if the call arrived through
-    /// one, or `None` otherwise.
+    /// one, or `None` otherwise (but see
+    /// [`wants_fallback_handle`](NodeFs::wants_fallback_handle)).
     fn setattr(
         &self,
         node: &Self::Node,
@@ -339,6 +342,24 @@ pub trait NodeFs: Sized + Send + Sync {
         caller: &Caller,
     ) -> Result<NodeAttr, Errno> {
         Err(Errno::ENOSYS)
+    }
+
+    /// Whether `getattr` and `setattr` on `node` should receive one of the
+    /// node's open file handles when the request names none.
+    ///
+    /// The kernel sends `fchmod`, `fchown`, `futimens` and most `fstat` calls
+    /// without a handle. Returning `true` makes the runtime pass the file
+    /// handle most recently opened on `node` that is still open, if any. That
+    /// handle may have been opened by a different process with different
+    /// flags, so it says nothing about the caller's access; and while it is
+    /// lent out, releasing it waits for the call to finish.
+    ///
+    /// The runtime asks only when `node` has something open. The default is
+    /// `false`. [`PathNodeFs`](crate::PathNodeFs) returns `true` once an open
+    /// node has lost its last name, since its handles are then the only way
+    /// to reach it.
+    fn wants_fallback_handle(&self, node: &Self::Node) -> bool {
+        false
     }
 
     /// Looks up `name` in directory `parent`. Return `Ok(Some(id))` for a

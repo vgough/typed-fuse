@@ -305,7 +305,10 @@ pub trait PathFilesystem: Send + Sync + Sized {
 
     /// Returns the attributes of `path`, including its current link count.
     /// `handle` is the open handle if the call arrived through one; `path`
-    /// is `None` if the open file's last known name has been unlinked.
+    /// is `None` if the open file's last known name has been unlinked. In
+    /// that case `handle` is one of the node's open handles even when the
+    /// kernel named none; it may belong to another process and have been
+    /// opened with different flags, so it does not show the caller's access.
     fn getattr(
         &self,
         node: PathNodeRef<'_, Self::NodeState>,
@@ -314,7 +317,8 @@ pub trait PathFilesystem: Send + Sync + Sized {
     ) -> Result<NodeAttr, Errno>;
 
     /// Applies the `Some` fields of `set` to `path`, returning the resulting
-    /// attributes.
+    /// attributes. `handle` and `path` are as for
+    /// [`getattr`](PathFilesystem::getattr).
     fn setattr(
         &self,
         node: PathNodeRef<'_, Self::NodeState>,
@@ -1213,6 +1217,10 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         )
     }
 
+    fn wants_fallback_handle(&self, node: &PathNode<P::NodeState>) -> bool {
+        self.node_path(node).is_none()
+    }
+
     fn lookup(
         &self,
         cx: &Cx<'_, PathNode<P::NodeState>>,
@@ -2034,6 +2042,9 @@ mod tests {
     struct RecordingFs {
         getattr_paths: Arc<Mutex<Vec<Option<PathBuf>>>>,
         getattr_states: Arc<Mutex<Vec<Arc<usize>>>>,
+        getattr_has_handle: Arc<Mutex<Vec<bool>>>,
+        setattr_paths: Arc<Mutex<Vec<Option<PathBuf>>>>,
+        setattr_has_handle: Arc<Mutex<Vec<bool>>>,
         forgotten_paths: Arc<Mutex<Vec<Option<PathBuf>>>>,
         next_state: Arc<AtomicUsize>,
         removed_names: Arc<Mutex<BTreeSet<OsString>>>,
@@ -2055,6 +2066,9 @@ mod tests {
             Self {
                 getattr_paths: Arc::default(),
                 getattr_states: Arc::default(),
+                getattr_has_handle: Arc::default(),
+                setattr_paths: Arc::default(),
+                setattr_has_handle: Arc::default(),
                 forgotten_paths: Arc::default(),
                 next_state: Arc::default(),
                 removed_names: Arc::default(),
@@ -2116,11 +2130,24 @@ mod tests {
         fn getattr(
             &self,
             node: PathNodeRef<'_, Self::NodeState>,
-            _handle: Option<&Self::Handle>,
+            handle: Option<&Self::Handle>,
             _caller: &Caller,
         ) -> Result<NodeAttr, Errno> {
             mutex(&self.getattr_paths).push(node.path().map(Path::to_path_buf));
             mutex(&self.getattr_states).push(node.state_arc());
+            mutex(&self.getattr_has_handle).push(handle.is_some());
+            Ok(NodeAttr::default())
+        }
+
+        fn setattr(
+            &self,
+            node: PathNodeRef<'_, Self::NodeState>,
+            handle: Option<&Self::Handle>,
+            _set: &SetAttr,
+            _caller: &Caller,
+        ) -> Result<NodeAttr, Errno> {
+            mutex(&self.setattr_paths).push(node.path().map(Path::to_path_buf));
+            mutex(&self.setattr_has_handle).push(handle.is_some());
             Ok(NodeAttr::default())
         }
 
@@ -2451,6 +2478,55 @@ mod tests {
         runtime.unlink(1, OsStr::new("renamed"), &caller).unwrap();
         runtime.getattr(node, Some(open.fh), &caller).unwrap();
         assert!(Arc::ptr_eq(&original, mutex(&states).last().unwrap()));
+    }
+
+    #[test]
+    fn unlinked_open_node_receives_open_handle_when_fh_is_omitted() {
+        let recording = RecordingFs::default();
+        let getattr_paths = Arc::clone(&recording.getattr_paths);
+        let getattr_has_handle = Arc::clone(&recording.getattr_has_handle);
+        let setattr_paths = Arc::clone(&recording.setattr_paths);
+        let setattr_has_handle = Arc::clone(&recording.setattr_has_handle);
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+
+        let (entry, open) = runtime
+            .create(1, OsStr::new("unlinked"), 0o600, 0, 0, &caller)
+            .unwrap();
+        runtime.unlink(1, OsStr::new("unlinked"), &caller).unwrap();
+
+        runtime.getattr(entry.ino, None, &caller).unwrap();
+        runtime
+            .setattr(entry.ino, None, &SetAttr::default(), &caller)
+            .unwrap();
+        runtime.release(entry.ino, open.fh, &caller).unwrap();
+
+        assert_eq!(mutex(&getattr_paths).as_slice(), [None]);
+        assert_eq!(mutex(&getattr_has_handle).as_slice(), [true]);
+        assert_eq!(mutex(&setattr_paths).as_slice(), [None]);
+        assert_eq!(mutex(&setattr_has_handle).as_slice(), [true]);
+    }
+
+    #[test]
+    fn linked_open_node_receives_no_handle_when_fh_is_omitted() {
+        let recording = RecordingFs::default();
+        let getattr_has_handle = Arc::clone(&recording.getattr_has_handle);
+        let setattr_has_handle = Arc::clone(&recording.setattr_has_handle);
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+
+        let (entry, open) = runtime
+            .create(1, OsStr::new("linked"), 0o600, 0, 0, &caller)
+            .unwrap();
+
+        runtime.getattr(entry.ino, None, &caller).unwrap();
+        runtime
+            .setattr(entry.ino, None, &SetAttr::default(), &caller)
+            .unwrap();
+        runtime.release(entry.ino, open.fh, &caller).unwrap();
+
+        assert_eq!(mutex(&getattr_has_handle).as_slice(), [false]);
+        assert_eq!(mutex(&setattr_has_handle).as_slice(), [false]);
     }
 
     #[derive(Default)]
