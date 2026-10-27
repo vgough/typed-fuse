@@ -1,13 +1,13 @@
 [package]
-name = "libfuse-sys"
+name = "typed-fuse-sys"
 version = "0.6.0"
-description = "Raw bindings to libfuse"
+description = "Raw bindings to libfuse 3, used by typed-fuse (fork of libfuse-sys)"
 repository = "https://github.com/vgough/typed-fuse"
 authors = ["Richard Wiedenhöft <richard@wiedenhoeft.xyz>", "Valient Gough <vgough@arg0.net>"]
 license = "MIT AND LGPL-2.0-or-later"
 categories = ["external-ffi-bindings"]
 keywords = ["fuse", "bindings", "filesystem", "fs"]
-readme = "README.md"
+readme = "../README.md"
 edition = "2024"
 build = "build.rs"
 

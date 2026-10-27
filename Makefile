@@ -7,7 +7,7 @@ update-deps:
 	cargo update
 
 hello_ll:
-	cargo build -p libfuse-sys --example hello_ll_raw --features fuse_35
+	cargo build -p typed-fuse-sys --example hello_ll_raw --features fuse_35
 
 memory_fs:
 	cargo build -p typed-fuse --example memory_fs

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Other changes
+
+- The crates are published on crates.io. The raw bindings in `libfuse-sys/`
+  are published as `typed-fuse-sys`, because the `libfuse-sys` name belongs
+  to the upstream crate; code that depends on them directly imports
+  `typed_fuse_sys`. `typed-fuse` still refers to them as `libfuse_sys`
+  internally.
+
 ## 0.8.2
 
 ### Fixes
