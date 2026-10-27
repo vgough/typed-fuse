@@ -17,22 +17,33 @@ use crate::node_fs::{
     PlusDirSink, XattrReply,
 };
 
+/// A directory entry for the kernel to cache: the node's inode number and
+/// generation, plus its attributes.
 #[derive(Clone, Copy, Debug)]
 pub struct EntryReply {
+    /// Inode number of the node.
     pub ino: u64,
+    /// Incremented each time `ino` is reused, so the kernel can tell an
+    /// old node from a new one with the same number.
     pub generation: u64,
+    /// The node's attributes.
     pub attr: NodeAttr,
 }
 
+/// The result of a successful lookup.
 #[derive(Clone, Copy, Debug)]
 pub enum LookupReply {
     Found(EntryReply),
     Negative,
 }
 
+/// The reply to an `open` or `opendir`.
 #[derive(Clone, Copy, Debug)]
 pub struct OpenReply {
+    /// Handle number the kernel passes back on later requests through this
+    /// open file or directory.
     pub fh: u64,
+    /// Caching and I/O hints the filesystem returned with the handle.
     pub hints: OpenHints,
 }
 
@@ -47,17 +58,27 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The filesystem's node, shared between its table slot and any
+/// [`NodeRef`] leases on it.
 struct NodeRecord<N> {
     payload: N,
 }
 
+/// One inode's entry in the [`NodeTable`]. The inode stays allocated while
+/// any of its counts is nonzero.
 struct Slot<N> {
     record: Arc<NodeRecord<N>>,
+    /// Incremented each time the inode number is reused.
     generation: u64,
+    /// Directory entries naming the node.
     links: u32,
+    /// Kernel lookups not yet returned by `forget`.
     lookups: u64,
+    /// Open file and directory handles.
     opens: u32,
+    /// Live [`NodeRef`] leases held by in-progress requests.
     leases: u32,
+    /// The directory the node was last placed in; readdir reports it as `..`.
     parent: NodeId,
 }
 
@@ -102,6 +123,8 @@ impl<N> NodeTable<N> {
     }
 }
 
+/// State shared by the [`Runtime`], [`Cx`] and every [`NodeRef`], so a
+/// lease can update its slot after the request that took it has returned.
 struct Shared<N> {
     table: Mutex<NodeTable<N>>,
 }
@@ -198,12 +221,21 @@ impl<'a, N> Cx<'a, N> {
     }
 }
 
+/// Lease bookkeeping for a [`HandleRecord`].
 struct HandleState {
+    /// Live [`HandleLease`]s.
     active: u32,
+    /// Set by `release` so no new leases are taken while it waits for
+    /// `active` to drain.
     closing: bool,
+    /// Set once the payload has been moved out, so `Drop` doesn't drop it
+    /// again.
     taken: bool,
 }
 
+/// An open file or directory handle and the node it was opened on.
+/// Requests borrow the payload through [`HandleLease`]s; `release` waits
+/// for them to finish and then moves the payload out.
 struct HandleRecord<H> {
     node: NodeId,
     payload: UnsafeCell<ManuallyDrop<H>>,
@@ -269,6 +301,8 @@ impl<H> Drop for HandleRecord<H> {
     }
 }
 
+/// Shared access to an open handle for the length of one request. It
+/// dereferences to the filesystem's handle.
 struct HandleLease<H> {
     record: Arc<HandleRecord<H>>,
 }
@@ -291,6 +325,8 @@ impl<H> Drop for HandleLease<H> {
     }
 }
 
+/// Open handles by handle number. Files and directories share one number
+/// sequence, so a handle number names at most one open handle.
 struct HandleTable<F: NodeFs> {
     files: BTreeMap<u64, Arc<HandleRecord<F::Handle>>>,
     dirs: BTreeMap<u64, Arc<HandleRecord<F::DirHandle>>>,
@@ -324,6 +360,10 @@ impl<F: NodeFs> HandleTable<F> {
     }
 }
 
+/// Runs a [`NodeFs`] behind FUSE's numeric interface. It assigns inode and
+/// handle numbers, tracks the kernel's lookup counts and the open handles
+/// on each node, and keeps nodes and handles alive while requests are using
+/// them, so callbacks for different requests can run at the same time.
 pub struct Runtime<F: NodeFs> {
     fs: F,
     shared: Arc<Shared<F::Node>>,
@@ -465,7 +505,7 @@ impl<F: NodeFs> Runtime<F> {
     }
     pub fn getattr(&self, ino: u64, fh: Option<u64>, caller: &Caller) -> Result<NodeAttr, Errno> {
         let n = self.node(ino)?;
-        let h = fh.map(|fh| self.file(ino, fh)).transpose()?;
+        let h = self.optional_file(ino, &n, fh)?;
         self.fs.getattr(&n, h.as_deref(), caller)
     }
     pub fn setattr(
@@ -476,7 +516,7 @@ impl<F: NodeFs> Runtime<F> {
         caller: &Caller,
     ) -> Result<NodeAttr, Errno> {
         let n = self.node(ino)?;
-        let h = fh.map(|fh| self.file(ino, fh)).transpose()?;
+        let h = self.optional_file(ino, &n, fh)?;
         self.fs.setattr(&n, h.as_deref(), set, caller)
     }
     pub fn readlink(&self, ino: u64, caller: &Caller) -> Result<PathBuf, Errno> {
@@ -540,6 +580,36 @@ impl<F: NodeFs> Runtime<F> {
             return Err(Errno::EBADF);
         }
         record.acquire().ok_or(Errno::EBADF)
+    }
+    /// Leases the file handle `getattr` or `setattr` should pass for `ino`:
+    /// the one `fh` names, or else, if the filesystem
+    /// [wants one](NodeFs::wants_fallback_handle), the handle most recently
+    /// opened on `ino`.
+    fn optional_file(
+        &self,
+        ino: u64,
+        node: &F::Node,
+        fh: Option<u64>,
+    ) -> Result<Option<HandleLease<F::Handle>>, Errno> {
+        if let Some(fh) = fh {
+            return self.file(ino, fh).map(Some);
+        }
+        // `opens` also counts directory handles, so it only rules out the
+        // scan. The table lock is released before calling the filesystem,
+        // which may take its own locks.
+        let open = lock(&self.shared.table)
+            .map
+            .get(&ino)
+            .is_some_and(|slot| slot.opens > 0);
+        if !open || !self.fs.wants_fallback_handle(node) {
+            return Ok(None);
+        }
+        Ok(lock(&self.handles)
+            .files
+            .values()
+            .rev()
+            .filter(|record| record.node.ino() == ino)
+            .find_map(HandleRecord::acquire))
     }
     fn dir(&self, ino: u64, fh: u64) -> Result<HandleLease<F::DirHandle>, Errno> {
         let record = lock(&self.handles)
@@ -733,6 +803,8 @@ impl<F: NodeFs> Runtime<F> {
             .map(|s| s.parent)
             .ok_or(Errno::ENOENT)?;
         let h = self.dir(ino, fh)?;
+        // Forwards entries to `inner` and records the ones the kernel
+        // accepted, whose lookups are rolled back if the listing fails.
         struct Accounting<'a, F: NodeFs> {
             rt: &'a Runtime<F>,
             inner: &'a mut dyn RuntimePlusSink,
@@ -972,11 +1044,15 @@ mod tests {
     use std::sync::{Barrier, RwLock};
     use std::thread;
 
+    /// Contents of a [`Mini`] node.
     enum Data {
         Dir(BTreeMap<String, NodeId>),
         File(Vec<u8>),
     }
+    /// A [`Mini`] node.
     struct Node(RwLock<Data>);
+    /// A minimal in-memory filesystem with create, unlink and read, for
+    /// testing node and handle lifetimes.
     struct Mini;
     impl NodeFs for Mini {
         type Node = Node;
@@ -1071,8 +1147,12 @@ mod tests {
         assert_eq!(e2.generation, 1);
     }
 
+    /// A root with one child that every lookup finds, counting `forget`
+    /// notifications.
     struct ForgetFs {
+        /// The child, inserted by `populate`.
         child: Mutex<Option<NodeId>>,
+        /// Number of `forget` callbacks received.
         notifications: AtomicUsize,
     }
     impl NodeFs for ForgetFs {
@@ -1140,8 +1220,126 @@ mod tests {
         rt.release(entry.ino, open.fh, &caller()).unwrap();
     }
 
+    /// Two nodes under the root (2 and 3) whose file handles are numbered
+    /// 1, 2, ... in open order, recording which handle each `getattr` and
+    /// `setattr` received.
+    #[derive(Default)]
+    struct HandleFallbackFs {
+        /// Returned from `wants_fallback_handle`.
+        wants_fallback: bool,
+        /// The last handle number given out.
+        next_handle: AtomicUsize,
+        /// The handle passed to each `getattr`, in call order.
+        getattr_handles: Mutex<Vec<Option<usize>>>,
+        /// The handle passed to each `setattr`, in call order.
+        setattr_handles: Mutex<Vec<Option<usize>>>,
+    }
+    impl NodeFs for HandleFallbackFs {
+        type Node = ();
+        type Handle = usize;
+        type DirHandle = ();
+
+        fn root(&mut self) {}
+        fn populate(&mut self, cx: &Cx<'_, ()>) {
+            cx.insert((), NodeId::ROOT);
+            cx.insert((), NodeId::ROOT);
+        }
+        fn getattr(&self, _: &(), handle: Option<&usize>, _: &Caller) -> Result<NodeAttr, Errno> {
+            lock(&self.getattr_handles).push(handle.copied());
+            Ok(NodeAttr::default())
+        }
+        fn setattr(
+            &self,
+            _: &(),
+            handle: Option<&usize>,
+            _: &SetAttr,
+            _: &Caller,
+        ) -> Result<NodeAttr, Errno> {
+            lock(&self.setattr_handles).push(handle.copied());
+            Ok(NodeAttr::default())
+        }
+        fn wants_fallback_handle(&self, _: &()) -> bool {
+            self.wants_fallback
+        }
+        fn open(&self, _: &(), _: i32, _: &Caller) -> Result<Opened<usize>, Errno> {
+            let id = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(Opened::new(id))
+        }
+        fn opendir(&self, _: &(), _: i32, _: &Caller) -> Result<Opened<()>, Errno> {
+            Ok(Opened::new(()))
+        }
+    }
+
+    #[test]
+    fn getattr_and_setattr_without_fh_get_no_handle_by_default() {
+        let rt = Runtime::new(HandleFallbackFs::default());
+        let open = rt.open(2, 0, &caller()).unwrap();
+        rt.getattr(2, None, &caller()).unwrap();
+        rt.setattr(2, None, &SetAttr::default(), &caller()).unwrap();
+        rt.getattr(2, Some(open.fh), &caller()).unwrap();
+        rt.release(2, open.fh, &caller()).unwrap();
+
+        assert_eq!(*lock(&rt.fs.getattr_handles), vec![None, Some(1)]);
+        assert_eq!(*lock(&rt.fs.setattr_handles), vec![None]);
+    }
+
+    #[test]
+    fn getattr_and_setattr_fall_back_to_newest_open_file_handle() {
+        let rt = Runtime::new(HandleFallbackFs {
+            wants_fallback: true,
+            ..HandleFallbackFs::default()
+        });
+        let set = SetAttr::default();
+
+        // No open handles yet -> None.
+        rt.getattr(2, None, &caller()).unwrap();
+        rt.setattr(2, None, &set, &caller()).unwrap();
+
+        // An open directory handle on node 2 does not supply a file handle.
+        let dir = rt.opendir(2, 0, &caller()).unwrap();
+        rt.getattr(2, None, &caller()).unwrap();
+        rt.releasedir(2, dir.fh, &caller()).unwrap();
+
+        // An open file handle on node 3 is never supplied for node 2.
+        let other = rt.open(3, 0, &caller()).unwrap();
+        rt.getattr(2, None, &caller()).unwrap();
+
+        // Opening two handles on node 2 supplies the newer one when fh is None,
+        // while an explicit fh still selects the requested handle.
+        let first = rt.open(2, 0, &caller()).unwrap();
+        let second = rt.open(2, 0, &caller()).unwrap();
+        rt.getattr(2, None, &caller()).unwrap();
+        rt.setattr(2, None, &set, &caller()).unwrap();
+        rt.getattr(2, Some(first.fh), &caller()).unwrap();
+        rt.setattr(2, Some(first.fh), &set, &caller()).unwrap();
+
+        // Releasing the newer handle falls back to the remaining older handle.
+        rt.release(2, second.fh, &caller()).unwrap();
+        rt.getattr(2, None, &caller()).unwrap();
+        rt.setattr(2, None, &set, &caller()).unwrap();
+
+        // Releasing the last handle on node 2 returns to None.
+        rt.release(2, first.fh, &caller()).unwrap();
+        rt.getattr(2, None, &caller()).unwrap();
+        rt.setattr(2, None, &set, &caller()).unwrap();
+        rt.release(3, other.fh, &caller()).unwrap();
+
+        assert_eq!(
+            *lock(&rt.fs.getattr_handles),
+            vec![None, None, None, Some(3), Some(2), Some(2), None]
+        );
+        assert_eq!(
+            *lock(&rt.fs.setattr_handles),
+            vec![None, Some(3), Some(2), Some(2), None]
+        );
+    }
+
+    /// A root whose readdirplus lists one child, optionally failing after
+    /// emitting it.
     struct PlusFs {
+        /// The child, inserted by `populate`.
         child: Mutex<Option<NodeId>>,
+        /// Fail the listing with `EIO` after the kernel accepts the child.
         fail_after_emit: bool,
     }
     impl NodeFs for PlusFs {
@@ -1181,6 +1379,8 @@ mod tests {
             }
         }
     }
+    /// A readdirplus sink that accepts every entry if its flag is set and
+    /// rejects every entry otherwise.
     struct CollectPlus(bool);
     impl RuntimePlusSink for CollectPlus {
         fn add(&mut self, _: &OsStr, _: EntryReply, _: u64) -> bool {
@@ -1209,6 +1409,8 @@ mod tests {
         }
     }
 
+    /// A filesystem whose `getattr` waits on a barrier, so a test passes
+    /// only if two `getattr` calls run at the same time.
     struct Overlap {
         barrier: Arc<Barrier>,
     }
@@ -1248,8 +1450,12 @@ mod tests {
         assert!(counts(&rt, e.ino).is_none());
     }
 
+    /// A [`HandleOverlap`] file handle whose `read` blocks until the test
+    /// lets it finish.
     struct BlockingHandle {
+        /// Reached when `read` starts.
         entered: Arc<Barrier>,
+        /// Waited on before `read` returns.
         finish: Arc<Barrier>,
     }
     impl Default for BlockingHandle {
@@ -1260,9 +1466,14 @@ mod tests {
             }
         }
     }
+    /// A filesystem with blocking reads, for checking that `release` waits
+    /// for a `read` on the same handle and consumes the handle once.
     struct HandleOverlap {
+        /// Shared with each opened [`BlockingHandle`].
         entered: Arc<Barrier>,
+        /// Shared with each opened [`BlockingHandle`].
         finish: Arc<Barrier>,
+        /// Number of `release` callbacks received.
         releases: Arc<AtomicUsize>,
     }
     impl NodeFs for HandleOverlap {
@@ -1333,6 +1544,8 @@ mod tests {
         assert_eq!(rt.release(1, open.fh, &caller()).unwrap_err(), Errno::EBADF);
     }
 
+    /// A filesystem whose first `getattr` panics if the flag starts set,
+    /// for checking that a panic doesn't leak a node lease.
     struct PanicOnce(AtomicBool);
     impl NodeFs for PanicOnce {
         type Node = ();

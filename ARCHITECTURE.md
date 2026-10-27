@@ -278,9 +278,16 @@ Every node callback receives `PathNodeRef`:
 
 State belongs to node identity, not to an individual pathname. Hard-link aliases share it, and it
 survives rename and unlink while the node remains open. If the final known name is unlinked,
-handle-oriented callbacks such as `read`, `write`, and `release` receive `path() == None` but still
-receive state and the handle. Implement handles so these operations do not require re-resolving the
-removed path (an open backing file descriptor is the usual answer).
+handle-oriented callbacks such as `read`, `write`, and `release`—as well as `getattr` and `setattr`
+even when the kernel omits `fh`—receive `path() == None` but still receive state and an open handle.
+Implement handles so these operations do not require re-resolving the removed path (an open backing
+file descriptor is the usual answer).
+
+When the kernel omits `fh` for such a node, the runtime lends `getattr` and `setattr` the node's most
+recently opened file handle that is still open (`NodeFs::wants_fallback_handle`). That handle may
+belong to another process and have been opened with different flags, so it does not prove the
+caller's access, and its `release` waits for the call to finish. Nodes that still have a name get
+`handle == None` as before.
 
 ### Adapter namespace
 
