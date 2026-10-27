@@ -17,22 +17,33 @@ use crate::node_fs::{
     PlusDirSink, XattrReply,
 };
 
+/// A directory entry for the kernel to cache: the node's inode number and
+/// generation, plus its attributes.
 #[derive(Clone, Copy, Debug)]
 pub struct EntryReply {
+    /// Inode number of the node.
     pub ino: u64,
+    /// Incremented each time `ino` is reused, so the kernel can tell an
+    /// old node from a new one with the same number.
     pub generation: u64,
+    /// The node's attributes.
     pub attr: NodeAttr,
 }
 
+/// The result of a successful lookup.
 #[derive(Clone, Copy, Debug)]
 pub enum LookupReply {
     Found(EntryReply),
     Negative,
 }
 
+/// The reply to an `open` or `opendir`.
 #[derive(Clone, Copy, Debug)]
 pub struct OpenReply {
+    /// Handle number the kernel passes back on later requests through this
+    /// open file or directory.
     pub fh: u64,
+    /// Caching and I/O hints the filesystem returned with the handle.
     pub hints: OpenHints,
 }
 
@@ -47,17 +58,27 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The filesystem's node, shared between its table slot and any
+/// [`NodeRef`] leases on it.
 struct NodeRecord<N> {
     payload: N,
 }
 
+/// One inode's entry in the [`NodeTable`]. The inode stays allocated while
+/// any of its counts is nonzero.
 struct Slot<N> {
     record: Arc<NodeRecord<N>>,
+    /// Incremented each time the inode number is reused.
     generation: u64,
+    /// Directory entries naming the node.
     links: u32,
+    /// Kernel lookups not yet returned by `forget`.
     lookups: u64,
+    /// Open file and directory handles.
     opens: u32,
+    /// Live [`NodeRef`] leases held by in-progress requests.
     leases: u32,
+    /// The directory the node was last placed in; readdir reports it as `..`.
     parent: NodeId,
 }
 
@@ -102,6 +123,8 @@ impl<N> NodeTable<N> {
     }
 }
 
+/// State shared by the [`Runtime`], [`Cx`] and every [`NodeRef`], so a
+/// lease can update its slot after the request that took it has returned.
 struct Shared<N> {
     table: Mutex<NodeTable<N>>,
 }
@@ -198,12 +221,21 @@ impl<'a, N> Cx<'a, N> {
     }
 }
 
+/// Lease bookkeeping for a [`HandleRecord`].
 struct HandleState {
+    /// Live [`HandleLease`]s.
     active: u32,
+    /// Set by `release` so no new leases are taken while it waits for
+    /// `active` to drain.
     closing: bool,
+    /// Set once the payload has been moved out, so `Drop` doesn't drop it
+    /// again.
     taken: bool,
 }
 
+/// An open file or directory handle and the node it was opened on.
+/// Requests borrow the payload through [`HandleLease`]s; `release` waits
+/// for them to finish and then moves the payload out.
 struct HandleRecord<H> {
     node: NodeId,
     payload: UnsafeCell<ManuallyDrop<H>>,
@@ -269,6 +301,8 @@ impl<H> Drop for HandleRecord<H> {
     }
 }
 
+/// Shared access to an open handle for the length of one request. It
+/// dereferences to the filesystem's handle.
 struct HandleLease<H> {
     record: Arc<HandleRecord<H>>,
 }
@@ -291,6 +325,8 @@ impl<H> Drop for HandleLease<H> {
     }
 }
 
+/// Open handles by handle number. Files and directories share one number
+/// sequence, so a handle number names at most one open handle.
 struct HandleTable<F: NodeFs> {
     files: BTreeMap<u64, Arc<HandleRecord<F::Handle>>>,
     dirs: BTreeMap<u64, Arc<HandleRecord<F::DirHandle>>>,
@@ -324,6 +360,10 @@ impl<F: NodeFs> HandleTable<F> {
     }
 }
 
+/// Runs a [`NodeFs`] behind FUSE's numeric interface. It assigns inode and
+/// handle numbers, tracks the kernel's lookup counts and the open handles
+/// on each node, and keeps nodes and handles alive while requests are using
+/// them, so callbacks for different requests can run at the same time.
 pub struct Runtime<F: NodeFs> {
     fs: F,
     shared: Arc<Shared<F::Node>>,
@@ -763,6 +803,8 @@ impl<F: NodeFs> Runtime<F> {
             .map(|s| s.parent)
             .ok_or(Errno::ENOENT)?;
         let h = self.dir(ino, fh)?;
+        // Forwards entries to `inner` and records the ones the kernel
+        // accepted, whose lookups are rolled back if the listing fails.
         struct Accounting<'a, F: NodeFs> {
             rt: &'a Runtime<F>,
             inner: &'a mut dyn RuntimePlusSink,
@@ -1002,11 +1044,15 @@ mod tests {
     use std::sync::{Barrier, RwLock};
     use std::thread;
 
+    /// Contents of a [`Mini`] node.
     enum Data {
         Dir(BTreeMap<String, NodeId>),
         File(Vec<u8>),
     }
+    /// A [`Mini`] node.
     struct Node(RwLock<Data>);
+    /// A minimal in-memory filesystem with create, unlink and read, for
+    /// testing node and handle lifetimes.
     struct Mini;
     impl NodeFs for Mini {
         type Node = Node;
@@ -1101,8 +1147,12 @@ mod tests {
         assert_eq!(e2.generation, 1);
     }
 
+    /// A root with one child that every lookup finds, counting `forget`
+    /// notifications.
     struct ForgetFs {
+        /// The child, inserted by `populate`.
         child: Mutex<Option<NodeId>>,
+        /// Number of `forget` callbacks received.
         notifications: AtomicUsize,
     }
     impl NodeFs for ForgetFs {
@@ -1170,11 +1220,18 @@ mod tests {
         rt.release(entry.ino, open.fh, &caller()).unwrap();
     }
 
+    /// Two nodes under the root (2 and 3) whose file handles are numbered
+    /// 1, 2, ... in open order, recording which handle each `getattr` and
+    /// `setattr` received.
     #[derive(Default)]
     struct HandleFallbackFs {
+        /// Returned from `wants_fallback_handle`.
         wants_fallback: bool,
+        /// The last handle number given out.
         next_handle: AtomicUsize,
+        /// The handle passed to each `getattr`, in call order.
         getattr_handles: Mutex<Vec<Option<usize>>>,
+        /// The handle passed to each `setattr`, in call order.
         setattr_handles: Mutex<Vec<Option<usize>>>,
     }
     impl NodeFs for HandleFallbackFs {
@@ -1277,8 +1334,12 @@ mod tests {
         );
     }
 
+    /// A root whose readdirplus lists one child, optionally failing after
+    /// emitting it.
     struct PlusFs {
+        /// The child, inserted by `populate`.
         child: Mutex<Option<NodeId>>,
+        /// Fail the listing with `EIO` after the kernel accepts the child.
         fail_after_emit: bool,
     }
     impl NodeFs for PlusFs {
@@ -1318,6 +1379,8 @@ mod tests {
             }
         }
     }
+    /// A readdirplus sink that accepts every entry if its flag is set and
+    /// rejects every entry otherwise.
     struct CollectPlus(bool);
     impl RuntimePlusSink for CollectPlus {
         fn add(&mut self, _: &OsStr, _: EntryReply, _: u64) -> bool {
@@ -1346,6 +1409,8 @@ mod tests {
         }
     }
 
+    /// A filesystem whose `getattr` waits on a barrier, so a test passes
+    /// only if two `getattr` calls run at the same time.
     struct Overlap {
         barrier: Arc<Barrier>,
     }
@@ -1385,8 +1450,12 @@ mod tests {
         assert!(counts(&rt, e.ino).is_none());
     }
 
+    /// A [`HandleOverlap`] file handle whose `read` blocks until the test
+    /// lets it finish.
     struct BlockingHandle {
+        /// Reached when `read` starts.
         entered: Arc<Barrier>,
+        /// Waited on before `read` returns.
         finish: Arc<Barrier>,
     }
     impl Default for BlockingHandle {
@@ -1397,9 +1466,14 @@ mod tests {
             }
         }
     }
+    /// A filesystem with blocking reads, for checking that `release` waits
+    /// for a `read` on the same handle and consumes the handle once.
     struct HandleOverlap {
+        /// Shared with each opened [`BlockingHandle`].
         entered: Arc<Barrier>,
+        /// Shared with each opened [`BlockingHandle`].
         finish: Arc<Barrier>,
+        /// Number of `release` callbacks received.
         releases: Arc<AtomicUsize>,
     }
     impl NodeFs for HandleOverlap {
@@ -1470,6 +1544,8 @@ mod tests {
         assert_eq!(rt.release(1, open.fh, &caller()).unwrap_err(), Errno::EBADF);
     }
 
+    /// A filesystem whose first `getattr` panics if the flag starts set,
+    /// for checking that a panic doesn't leak a node lease.
     struct PanicOnce(AtomicBool);
     impl NodeFs for PanicOnce {
         type Node = ();

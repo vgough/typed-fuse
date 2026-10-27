@@ -726,16 +726,24 @@ impl<S> std::fmt::Debug for PathNode<S> {
     }
 }
 
+/// A name within a parent directory.
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct Dentry {
     parent: NodeId,
     name: OsString,
 }
 
+/// The names [`PathNodeFs`] knows for its nodes, from which it builds each
+/// node's path.
 struct Namespace {
+    /// The node each name refers to.
     by_name: BTreeMap<Dentry, NodeId>,
+    /// Every name of each node; more than one for hard links. A node with no
+    /// entry here has no path.
     aliases: BTreeMap<NodeId, BTreeSet<Dentry>>,
+    /// The runtime id of each [`PathNode`], by its key.
     keys: BTreeMap<u64, NodeId>,
+    /// The key the next new [`PathNode`] gets.
     next_key: u64,
 }
 
@@ -853,7 +861,10 @@ enum DirRead<S> {
     Ended,
 }
 
+/// The listings one directory handle keeps so reads can resume from a
+/// cookie, newest last.
 struct DirListings<S> {
+    /// The generation the next listing gets.
     next_generation: u8,
     /// Oldest first; the last listing is the current one.
     retained: VecDeque<Arc<DirListing<S>>>,
@@ -2038,26 +2049,55 @@ mod tests {
         assert!(emitted.is_empty());
     }
 
+    /// A [`PathFilesystem`] for testing [`PathNodeFs`]. It records what its
+    /// callbacks receive, and its settings make lookups and listings fail
+    /// or block. Every name it hasn't unlinked exists. Each lookup or create
+    /// returns a new state counting up from 1 (the root's is 0), and
+    /// every directory lists `directory_names`.
+    ///
+    /// The recordings are shared `Arc`s, so a test clones the ones it
+    /// checks before handing the filesystem to [`PathNodeFs::new`].
     #[derive(Clone)]
     struct RecordingFs {
+        /// The path passed to each `getattr`, in call order.
         getattr_paths: Arc<Mutex<Vec<Option<PathBuf>>>>,
+        /// The node state passed to each `getattr`.
         getattr_states: Arc<Mutex<Vec<Arc<usize>>>>,
+        /// Whether each `getattr` received a handle.
         getattr_has_handle: Arc<Mutex<Vec<bool>>>,
+        /// The path passed to each `setattr`.
         setattr_paths: Arc<Mutex<Vec<Option<PathBuf>>>>,
+        /// Whether each `setattr` received a handle.
         setattr_has_handle: Arc<Mutex<Vec<bool>>>,
+        /// The path passed to each `forget`.
         forgotten_paths: Arc<Mutex<Vec<Option<PathBuf>>>>,
+        /// The last state given to a looked-up or created node.
         next_state: Arc<AtomicUsize>,
+        /// Names unlinked and not created again; lookups of them miss.
         removed_names: Arc<Mutex<BTreeSet<OsString>>>,
+        /// The names every `list_dir` returns.
         directory_names: Arc<Mutex<Vec<OsString>>>,
+        /// Number of `list_dir` calls. Listed entries get state
+        /// `10_000 + call number`.
         list_calls: Arc<AtomicUsize>,
+        /// Fail the next `list_dir` with `EIO`.
         fail_next_list: Arc<AtomicBool>,
+        /// If set, each `list_dir` waits on this barrier before listing.
         list_barrier: Option<Arc<Barrier>>,
+        /// Start each listing with `.` and `..`.
         include_dots: bool,
+        /// List entries with only their kind instead of full attributes.
         kind_only: bool,
+        /// Fail lookups of `removed_names` with `ENOENT` instead of
+        /// returning a negative entry.
         removed_lookup_fails: bool,
+        /// Names whose lookup fails with `EIO`.
         failing_lookups: Arc<Mutex<BTreeSet<OsString>>>,
+        /// The handle every `opendir` returns.
         dir_handle: usize,
+        /// The handle passed to each `fsyncdir`.
         fsyncdir_handles: Arc<Mutex<Vec<usize>>>,
+        /// The handle passed to each `releasedir`.
         releasedir_handles: Arc<Mutex<Vec<usize>>>,
     }
 
@@ -2529,9 +2569,13 @@ mod tests {
         assert_eq!(mutex(&setattr_has_handle).as_slice(), [false]);
     }
 
+    /// A runtime readdir sink that records each entry it accepts.
     #[derive(Default)]
     struct CollectingSink {
+        /// Name, node and resume offset of each accepted entry.
         seen: Vec<(OsString, NodeId, u64)>,
+        /// If set, reject entries once this many have been accepted, as a
+        /// full kernel buffer would.
         accept_limit: Option<usize>,
     }
 
@@ -2545,10 +2589,15 @@ mod tests {
         }
     }
 
+    /// A runtime readdirplus sink that records each entry it accepts.
     #[derive(Default)]
     struct CollectingPlusSink {
+        /// Name, inode number and resume offset of each accepted entry.
         seen: Vec<(OsString, u64, u64)>,
+        /// The `size` attribute of each accepted entry.
         sizes: Vec<u64>,
+        /// If set, reject entries once this many have been accepted, as a
+        /// full kernel buffer would.
         accept_limit: Option<usize>,
     }
 
@@ -3253,9 +3302,13 @@ mod tests {
         assert_eq!(list_calls.load(Ordering::SeqCst), calls);
     }
 
+    /// A [`PathDirSink`] for testing [`DirBuffer::fill`] directly.
     #[derive(Default)]
     struct RecordingDirSink {
+        /// Name and resume offset of each entry, including the one that
+        /// stopped the fill.
         seen: Vec<(OsString, u64)>,
+        /// If set, report the buffer full after this many entries.
         stop_after: Option<usize>,
     }
 
@@ -3272,8 +3325,12 @@ mod tests {
         }
     }
 
+    /// A [`PathPlusDirSink`] for testing [`DirBuffer::fill_plus`] directly.
+    /// It accepts every entry.
     #[derive(Default)]
     struct RecordingPlusDirSink {
+        /// Name, resume offset, and whether attributes came with it, for
+        /// each entry.
         seen: Vec<(OsString, u64, bool)>,
     }
 
