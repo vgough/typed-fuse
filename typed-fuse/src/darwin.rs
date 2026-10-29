@@ -11,9 +11,12 @@
 //!
 //! This crate keeps Darwin extensions disabled (`set_darwin_extensions_enabled(0)`,
 //! done in `session.rs`) and only ever works with the portable vanilla structs
-//! (`stat` / `fuse_entry_param` / `statvfs`), so it must bind directly to the
+//! (`stat` / `fuse_entry_param`), so it must bind directly to the
 //! plain symbol names instead of going through libfuse-sys's aliased
-//! declarations.
+//! declarations. The exception is `fuse_reply_statfs`: its vanilla variant
+//! takes a `statvfs`, whose block/file counts are 32-bit on macOS, so
+//! `session.rs` uses the bindings' `$DARWIN` declaration (`struct statfs`)
+//! directly.
 //!
 //! See the root crate's `examples/hello_ll.rs` (lines 44-65) for the original
 //! version of this workaround, and the `darwin-symbol-aliasing` memory note.
@@ -41,13 +44,6 @@ unsafe extern "C" {
         e: *const EntryParam,
         fi: *const fuse_file_info,
     ) -> c_int;
-
-    // The vanilla symbol takes a `statvfs` (only the `$DARWIN` alias takes
-    // a `statfs`), and the bindings only contain the `$DARWIN` signature's
-    // `statfs` — so the parameter type comes from `libc`.
-    #[link_name = "fuse_reply_statfs"]
-    pub(crate) fn fuse_reply_statfs_vanilla(req: fuse_req_t, stbuf: *const libc::statvfs)
-    -> c_int;
 
     #[link_name = "fuse_add_direntry"]
     pub(crate) fn fuse_add_direntry_vanilla(

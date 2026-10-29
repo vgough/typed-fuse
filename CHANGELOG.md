@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixes
+
+- On macOS, `statfs` no longer truncates block and inode counts to 32 bits,
+  which made large volumes (such as big network shares) report the wrong
+  size and free space. `passthrough::statfs_path` now uses `statfs(2)`
+  instead of `statvfs(3)`, and replies go through libfuse's `struct statfs`
+  variant of `fuse_reply_statfs`. Both `statvfs` versions use 32-bit counts
+  on macOS.
+
 ### Other changes
 
 - The crates are published on crates.io. The raw bindings in `libfuse-sys/`
