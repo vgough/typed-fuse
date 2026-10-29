@@ -3,9 +3,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use typed_fuse::passthrough::{file_attr_from_metadata, file_kind_from_file_type};
+use typed_fuse::passthrough::{file_attr_from_metadata, file_kind_from_file_type, statfs_path};
 use typed_fuse::{
-    Caller, DirBuffer, Errno, NodeAttr, Opened, PathEntry, PathFilesystem, PathNodeRef,
+    Caller, DirBuffer, Errno, NodeAttr, Opened, PathEntry, PathFilesystem, PathNodeRef, StatFs,
 };
 
 /// A minimal read-only passthrough used by the path-listing example and live
@@ -110,5 +110,9 @@ impl PathFilesystem for ReadOnlyPathFs {
             );
         }
         Ok(listing)
+    }
+
+    fn statfs(&self, _path: &Path, _caller: &Caller) -> Result<StatFs, Errno> {
+        statfs_path(&self.root)
     }
 }

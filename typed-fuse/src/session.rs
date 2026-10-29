@@ -21,8 +21,9 @@
 //! and the direntry builders are aliased to non-existent `<name>$DARWIN`
 //! symbols. This module (and `ffi.rs`) always go through the cfg'd
 //! `raw_reply_*`/`raw_add_direntry*` wrappers so the rest of the code stays
-//! `#[cfg]`-free. `setattr`'s callback is typed `*mut fuse_darwin_attr` by
-//! bindgen on macOS; since Darwin extensions are disabled at the session
+//! `#[cfg]`-free. The statfs reply is the exception: it deliberately calls
+//! the `$DARWIN` variant to keep 64-bit block/file counts. `setattr`'s
+//! callback is typed `*mut fuse_darwin_attr` by bindgen on macOS; since Darwin extensions are disabled at the session
 //! level, libfuse actually passes a vanilla `stat*`, which `setattr_shim`
 //! reinterprets.
 
@@ -69,19 +70,14 @@ use libfuse_sys::fuse_lowlevel::{
 };
 
 #[cfg(target_os = "macos")]
-use libc::statvfs;
-#[cfg(target_os = "macos")]
-use libfuse_sys::fuse_lowlevel::fuse_darwin_attr;
+use libfuse_sys::fuse_lowlevel::{fuse_darwin_attr, fuse_reply_statfs, statfs};
 #[cfg(not(target_os = "macos"))]
 use libfuse_sys::fuse_lowlevel::{
     fuse_reply_attr, fuse_reply_create, fuse_reply_entry, fuse_reply_statfs, statvfs,
 };
 
 #[cfg(target_os = "macos")]
-use crate::darwin::{
-    fuse_reply_attr_vanilla, fuse_reply_create_vanilla, fuse_reply_entry_vanilla,
-    fuse_reply_statfs_vanilla,
-};
+use crate::darwin::{fuse_reply_attr_vanilla, fuse_reply_create_vanilla, fuse_reply_entry_vanilla};
 
 use typed_fuse_core::{Caller, Errno, FileLock, LookupReply, NodeFs, Runtime, XattrReply};
 
@@ -131,9 +127,13 @@ fn raw_reply_create(
     unsafe { fuse_reply_create(req, e, fi) }
 }
 
+// Unlike the other replies, statfs deliberately uses the `$DARWIN` alias:
+// the vanilla one takes a `statvfs`, whose counts are 32-bit on macOS. The
+// `$DARWIN` variant only changes the argument type and doesn't depend on
+// Darwin extensions being enabled for the session.
 #[cfg(target_os = "macos")]
-fn raw_reply_statfs(req: fuse_req_t, stbuf: *const statvfs) -> c_int {
-    unsafe { fuse_reply_statfs_vanilla(req, stbuf) }
+fn raw_reply_statfs(req: fuse_req_t, stbuf: *const statfs) -> c_int {
+    unsafe { fuse_reply_statfs(req, stbuf) }
 }
 #[cfg(not(target_os = "macos"))]
 fn raw_reply_statfs(req: fuse_req_t, stbuf: *const statvfs) -> c_int {

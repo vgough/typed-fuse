@@ -119,8 +119,9 @@ pub fn synthetic_file_attr(
 }
 
 /// Query filesystem-wide statistics for the filesystem backing `path`
-/// (`statvfs(2)`). The field-width casts here absorb the Linux/macOS
+/// (`statvfs(2)`). The field-width casts here absorb the Linux/BSD
 /// `statvfs` layout differences.
+#[cfg(not(target_os = "macos"))]
 pub fn statfs_path(path: &Path) -> Result<StatFs, Errno> {
     let c_path = c_path(path)?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -137,6 +138,35 @@ pub fn statfs_path(path: &Path) -> Result<StatFs, Errno> {
         bsize: stat.f_bsize as u32,
         namelen: stat.f_namemax as u32,
         frsize: stat.f_frsize as u32,
+    })
+}
+
+/// Query filesystem-wide statistics for the filesystem backing `path`.
+///
+/// macOS's `statvfs` has 32-bit `fsblkcnt_t`/`fsfilcnt_t`, so block and
+/// inode counts of large volumes (e.g. network shares) silently wrap. Use
+/// `statfs(2)`, whose counts are 64-bit, mapping fields the way libc's
+/// `statvfs` does: `f_bsize` is the fundamental block size the counts are
+/// in, `f_iosize` the preferred I/O size. `struct statfs` has no name
+/// limit, so that comes from `pathconf(_PC_NAME_MAX)`.
+#[cfg(target_os = "macos")]
+pub fn statfs_path(path: &Path) -> Result<StatFs, Errno> {
+    let c_path = c_path(path)?;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
+    if ret != 0 {
+        return Err(last_errno());
+    }
+    let namemax = unsafe { libc::pathconf(c_path.as_ptr(), libc::_PC_NAME_MAX) };
+    Ok(StatFs {
+        blocks: stat.f_blocks,
+        bfree: stat.f_bfree,
+        bavail: stat.f_bavail,
+        files: stat.f_files,
+        ffree: stat.f_ffree,
+        bsize: stat.f_iosize as u32,
+        namelen: if namemax > 0 { namemax as u32 } else { 255 },
+        frsize: stat.f_bsize,
     })
 }
 

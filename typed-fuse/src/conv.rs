@@ -16,9 +16,7 @@ use libfuse_sys::fuse_lowlevel::{
     FUSE_SET_ATTR_UID,
 };
 #[cfg(target_os = "macos")]
-use libc::statvfs;
-#[cfg(target_os = "macos")]
-use libfuse_sys::fuse_lowlevel::{timespec, FUSE_SET_ATTR_BTIME, FUSE_SET_ATTR_CTIME};
+use libfuse_sys::fuse_lowlevel::{statfs, timespec, FUSE_SET_ATTR_BTIME, FUSE_SET_ATTR_CTIME};
 #[cfg(not(target_os = "macos"))]
 use libfuse_sys::fuse_lowlevel::{statvfs, FUSE_SET_ATTR_CTIME};
 
@@ -251,11 +249,8 @@ pub(crate) fn setattr_from_raw(attr: *const stat, to_set: c_int) -> SetAttr {
     out
 }
 
-/// Converts to the raw `statvfs` expected by `fuse_reply_statfs`. On macOS
-/// this is the vanilla (non-`$DARWIN`) symbol's parameter type — only the
-/// `$DARWIN` alias takes a `struct statfs` — and the bindings never see
-/// `statvfs`, hence `libc`'s. Note macOS's `fsblkcnt_t` is 32-bit, so the
-/// block/file counts truncate there.
+/// Converts to the raw `statvfs` expected by `fuse_reply_statfs`.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn statfs_to_raw(s: &StatFs) -> statvfs {
     let mut out: statvfs = unsafe { std::mem::zeroed() };
     out.f_bsize = s.bsize as _;
@@ -266,6 +261,25 @@ pub(crate) fn statfs_to_raw(s: &StatFs) -> statvfs {
     out.f_files = s.files as _;
     out.f_ffree = s.ffree as _;
     out.f_namemax = s.namelen as _;
+    out
+}
+
+/// Converts to the raw `struct statfs` expected by the `$DARWIN` variant of
+/// `fuse_reply_statfs`. The vanilla variant takes a `statvfs`, whose
+/// `fsblkcnt_t`/`fsfilcnt_t` are 32-bit on macOS and would truncate the
+/// counts of large volumes. libfuse maps `f_bsize` to the kernel's `frsize`
+/// and `f_iosize` to its `bsize`; it has no field for the name limit and
+/// always sends 0 for it.
+#[cfg(target_os = "macos")]
+pub(crate) fn statfs_to_raw(s: &StatFs) -> statfs {
+    let mut out: statfs = unsafe { std::mem::zeroed() };
+    out.f_bsize = if s.frsize != 0 { s.frsize } else { s.bsize };
+    out.f_iosize = s.bsize as _;
+    out.f_blocks = s.blocks;
+    out.f_bfree = s.bfree;
+    out.f_bavail = s.bavail;
+    out.f_files = s.files;
+    out.f_ffree = s.ffree;
     out
 }
 
@@ -389,8 +403,36 @@ mod tests {
         assert_eq!(raw.f_bavail, 400);
         assert_eq!(raw.f_files, 100);
         assert_eq!(raw.f_ffree, 50);
-        assert_eq!(raw.f_bsize, 4096);
-        assert_eq!(raw.f_frsize, 2048);
-        assert_eq!(raw.f_namemax, 255);
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(raw.f_bsize, 4096);
+            assert_eq!(raw.f_frsize, 2048);
+            assert_eq!(raw.f_namemax, 255);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(raw.f_iosize, 4096);
+            assert_eq!(raw.f_bsize, 2048);
+        }
+    }
+
+    #[test]
+    fn statfs_conversion_keeps_64_bit_counts() {
+        let sfs = StatFs {
+            blocks: 7_804_858_368,
+            bfree: 5_732_936_640,
+            bavail: 5_732_936_640,
+            files: 7_804_858_368,
+            ffree: 5_732_936_640,
+            bsize: 1024,
+            namelen: 255,
+            frsize: 1024,
+        };
+        let raw = statfs_to_raw(&sfs);
+        assert_eq!(raw.f_blocks as u64, sfs.blocks);
+        assert_eq!(raw.f_bfree as u64, sfs.bfree);
+        assert_eq!(raw.f_bavail as u64, sfs.bavail);
+        assert_eq!(raw.f_files as u64, sfs.files);
+        assert_eq!(raw.f_ffree as u64, sfs.ffree);
     }
 }
