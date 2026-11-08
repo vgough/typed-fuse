@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.4
+
+### Other changes
+
+- New `PathFilesystem::admit`, defaulting to `Ok(())`. `PathNodeFs` calls it
+  with the request's `PathOp` and caller before taking its locks or resolving
+  a path, and fails the request with the returned error without calling the
+  operation. It may block, for example to authenticate the caller, without
+  holding up other requests. Namespace changes run under the adapter's
+  exclusive lock, so blocking inside them stalls every request. `forget`,
+  `release` and `releasedir` are never admitted. `typed-fuse-core` is now
+  0.7.1.
+
 ## 0.8.3
 
 ### Fixes

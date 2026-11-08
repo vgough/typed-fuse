@@ -246,6 +246,44 @@ pub fn replay(offset: u64, len: usize, mut emit: impl FnMut(usize, u64) -> bool)
     }
 }
 
+/// The operation a request asks for, as passed to [`PathFilesystem::admit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PathOp {
+    Lookup,
+    Getattr,
+    Setattr,
+    Readlink,
+    Mknod,
+    Mkdir,
+    Symlink,
+    Unlink,
+    Rmdir,
+    Rename,
+    Link,
+    Open,
+    Read,
+    Write,
+    Flush,
+    Fsync,
+    Opendir,
+    /// `readdir` or `readdirplus`, once per page.
+    Readdir,
+    Fsyncdir,
+    Statfs,
+    Setxattr,
+    Getxattr,
+    Listxattr,
+    Removexattr,
+    Access,
+    Create,
+    Fallocate,
+    Lseek,
+    Getlk,
+    Setlk,
+    Flock,
+}
+
 /// A synchronous path-based filesystem interface.
 ///
 /// Paths are absolute virtual paths rooted at `/`. An optional path is absent
@@ -282,6 +320,21 @@ pub trait PathFilesystem: Send + Sync + Sized {
     fn init(&self, conn: &mut ConnInfo) {}
     /// Called on filesystem exit.
     fn destroy(&self) {}
+
+    /// Decides whether to serve a request, before the adapter takes any of
+    /// its locks or resolves a path. Returning `Err` fails the request with
+    /// that error without calling the operation.
+    ///
+    /// Since no lock is held, this may block (to authenticate the caller,
+    /// say) without holding up other requests. The operations themselves
+    /// shouldn't: namespace changes hold an exclusive adapter lock while they
+    /// run, which stalls every other request.
+    ///
+    /// Not called for `forget`, `release` or `releasedir`, which must always
+    /// reach the filesystem so it can free what they release.
+    fn admit(&self, op: PathOp, caller: &Caller) -> Result<(), Errno> {
+        Ok(())
+    }
 
     /// Called when the kernel's lookup count for a node reaches zero.
     ///
@@ -1184,6 +1237,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         handle: Option<&P::Handle>,
         caller: &Caller,
     ) -> Result<NodeAttr, Errno> {
+        self.inner.admit(PathOp::Getattr, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node);
         self.inner.getattr(
@@ -1215,6 +1269,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         set: &SetAttr,
         caller: &Caller,
     ) -> Result<NodeAttr, Errno> {
+        self.inner.admit(PathOp::Setattr, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node);
         self.inner.setattr(
@@ -1239,6 +1294,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         name: &OsStr,
         caller: &Caller,
     ) -> Result<Option<NodeId>, Errno> {
+        self.inner.admit(PathOp::Lookup, caller)?;
         let _guard = read_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         let parent_path = self.path(parent)?;
@@ -1257,6 +1313,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     }
 
     fn readlink(&self, node: &PathNode<P::NodeState>, caller: &Caller) -> Result<PathBuf, Errno> {
+        self.inner.admit(PathOp::Readlink, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.readlink(
@@ -1278,6 +1335,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         umask: u32,
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
+        self.inner.admit(PathOp::Mknod, caller)?;
         let _guard = write_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         parent_node.entries_changed();
@@ -1305,6 +1363,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         umask: u32,
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
+        self.inner.admit(PathOp::Mkdir, caller)?;
         let _guard = write_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         parent_node.entries_changed();
@@ -1330,6 +1389,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         target: &Path,
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
+        self.inner.admit(PathOp::Symlink, caller)?;
         let _guard = write_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         parent_node.entries_changed();
@@ -1353,6 +1413,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         name: &OsStr,
         caller: &Caller,
     ) -> Result<(), Errno> {
+        self.inner.admit(PathOp::Unlink, caller)?;
         self.remove_entry(cx, parent, name, caller, false)
     }
 
@@ -1363,6 +1424,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         name: &OsStr,
         caller: &Caller,
     ) -> Result<(), Errno> {
+        self.inner.admit(PathOp::Rmdir, caller)?;
         self.remove_entry(cx, parent, name, caller, true)
     }
 
@@ -1379,6 +1441,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         if flags != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
+        self.inner.admit(PathOp::Rename, caller)?;
         let _guard = write_lock(&self.operations);
         let old_parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         let new_parent_node = cx.get(newparent).ok_or(Errno::ENOENT)?;
@@ -1431,6 +1494,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         newname: &OsStr,
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
+        self.inner.admit(PathOp::Link, caller)?;
         let _guard = write_lock(&self.operations);
         let source_node = cx.get(id).ok_or(Errno::ENOENT)?;
         let parent_node = cx.get(newparent).ok_or(Errno::ENOENT)?;
@@ -1464,6 +1528,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         flags: i32,
         caller: &Caller,
     ) -> Result<Opened<P::Handle>, Errno> {
+        self.inner.admit(PathOp::Open, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.open(
@@ -1484,6 +1549,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         size: usize,
         caller: &Caller,
     ) -> Result<Cow<'a, [u8]>, Errno> {
+        self.inner.admit(PathOp::Read, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node);
         self.inner.read(
@@ -1506,6 +1572,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         offset: u64,
         caller: &Caller,
     ) -> Result<usize, Errno> {
+        self.inner.admit(PathOp::Write, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node);
         self.inner.write(
@@ -1526,6 +1593,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         handle: &P::Handle,
         caller: &Caller,
     ) -> Result<(), Errno> {
+        self.inner.admit(PathOp::Flush, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.flush(
@@ -1561,6 +1629,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         datasync: bool,
         caller: &Caller,
     ) -> Result<(), Errno> {
+        self.inner.admit(PathOp::Fsync, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.fsync(
@@ -1580,6 +1649,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         flags: i32,
         caller: &Caller,
     ) -> Result<Opened<PathDirHandle<P>>, Errno> {
+        self.inner.admit(PathOp::Opendir, caller)?;
         let _g = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         let opened = self.inner.opendir(
@@ -1610,6 +1680,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         sink: &mut dyn DirSink,
         caller: &Caller,
     ) -> Result<(), Errno> {
+        self.inner.admit(PathOp::Readdir, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         let DirRead::Listing {
@@ -1652,6 +1723,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         sink: &mut dyn PlusDirSink,
         caller: &Caller,
     ) -> Result<(), Errno> {
+        self.inner.admit(PathOp::Readdir, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         let DirRead::Listing {
@@ -1711,6 +1783,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         datasync: bool,
         caller: &Caller,
     ) -> Result<(), Errno> {
+        self.inner.admit(PathOp::Fsyncdir, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.fsyncdir(
@@ -1724,6 +1797,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         )
     }
     fn statfs(&self, caller: &Caller) -> Result<StatFs, Errno> {
+        self.inner.admit(PathOp::Statfs, caller)?;
         let _g = read_lock(&self.operations);
         self.inner.statfs(Path::new("/"), caller)
     }
@@ -1736,6 +1810,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         flags: i32,
         caller: &Caller,
     ) -> Result<(), Errno> {
+        self.inner.admit(PathOp::Setxattr, caller)?;
         let _g = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.setxattr(
@@ -1756,6 +1831,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         size: usize,
         caller: &Caller,
     ) -> Result<XattrReply, Errno> {
+        self.inner.admit(PathOp::Getxattr, caller)?;
         let _g = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.getxattr(
@@ -1774,6 +1850,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         size: usize,
         caller: &Caller,
     ) -> Result<XattrReply, Errno> {
+        self.inner.admit(PathOp::Listxattr, caller)?;
         let _g = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.listxattr(
@@ -1791,6 +1868,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         name: &OsStr,
         caller: &Caller,
     ) -> Result<(), Errno> {
+        self.inner.admit(PathOp::Removexattr, caller)?;
         let _g = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.removexattr(
@@ -1808,6 +1886,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         mask: i32,
         caller: &Caller,
     ) -> Result<(), Errno> {
+        self.inner.admit(PathOp::Access, caller)?;
         let _g = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.access(
@@ -1830,6 +1909,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         flags: i32,
         caller: &Caller,
     ) -> Result<(NodeId, Opened<P::Handle>), Errno> {
+        self.inner.admit(PathOp::Create, caller)?;
         let _g = write_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         parent_node.entries_changed();
@@ -1856,6 +1936,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         length: u64,
         caller: &Caller,
     ) -> Result<(), Errno> {
+        self.inner.admit(PathOp::Fallocate, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.fallocate(
@@ -1878,6 +1959,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         whence: i32,
         caller: &Caller,
     ) -> Result<u64, Errno> {
+        self.inner.admit(PathOp::Lseek, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.lseek(
@@ -1899,6 +1981,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         lock: FileLock,
         caller: &Caller,
     ) -> Result<FileLock, Errno> {
+        self.inner.admit(PathOp::Getlk, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.getlk(
@@ -1921,6 +2004,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         sleep: bool,
         caller: &Caller,
     ) -> Result<(), Errno> {
+        self.inner.admit(PathOp::Setlk, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.setlk(
@@ -1942,6 +2026,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         operation: i32,
         caller: &Caller,
     ) -> Result<(), Errno> {
+        self.inner.admit(PathOp::Flock, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.flock(
@@ -2002,8 +2087,9 @@ impl<P: PathFilesystem> PathNodeFs<P> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Condvar, mpsc};
     use std::thread;
+    use std::time::Duration;
 
     use super::*;
     use crate::{EntryReply, LookupReply, Runtime, RuntimePlusSink};
@@ -2313,6 +2399,115 @@ mod tests {
             mutex(&self.releasedir_handles).push(handle);
             Ok(())
         }
+    }
+
+    /// Holds mkdir in `admit` until released, and refuses every open there.
+    struct AdmitFs {
+        entered: Mutex<mpsc::Sender<()>>,
+        released: Arc<(Mutex<bool>, Condvar)>,
+        mkdirs: Arc<AtomicUsize>,
+        opens: Arc<AtomicUsize>,
+    }
+
+    impl PathFilesystem for AdmitFs {
+        type NodeState = ();
+        type Handle = ();
+        type DirHandle = ();
+
+        fn root_state(&mut self) -> Arc<Self::NodeState> {
+            Arc::new(())
+        }
+
+        fn admit(&self, op: PathOp, _caller: &Caller) -> Result<(), Errno> {
+            match op {
+                PathOp::Mkdir => {
+                    mutex(&self.entered).send(()).unwrap();
+                    let (released, cvar) = &*self.released;
+                    drop(cvar.wait_while(mutex(released), |r| !*r).unwrap());
+                    Ok(())
+                }
+                PathOp::Open => Err(Errno::EACCES),
+                _ => Ok(()),
+            }
+        }
+
+        fn getattr(
+            &self,
+            _node: PathNodeRef<'_, Self::NodeState>,
+            _handle: Option<&Self::Handle>,
+            _caller: &Caller,
+        ) -> Result<NodeAttr, Errno> {
+            Ok(NodeAttr::default())
+        }
+
+        fn mkdir(
+            &self,
+            _parent: PathNodeRef<'_, Self::NodeState>,
+            _name: &OsStr,
+            _mode: u32,
+            _umask: u32,
+            _caller: &Caller,
+        ) -> Result<PathEntry<Self::NodeState>, Errno> {
+            self.mkdirs.fetch_add(1, Ordering::SeqCst);
+            Ok(PathEntry::new(NodeAttr::default(), Arc::new(())))
+        }
+
+        fn open(
+            &self,
+            _node: PathNodeRef<'_, Self::NodeState>,
+            _flags: i32,
+            _caller: &Caller,
+        ) -> Result<Opened<Self::Handle>, Errno> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Opened::new(()))
+        }
+    }
+
+    /// A request blocked in `admit` holds no adapter lock, even for an
+    /// operation that takes the exclusive one, and a refusal skips the
+    /// operation.
+    #[test]
+    fn admit_runs_before_adapter_locks_and_can_refuse() {
+        let (entered, prompted) = mpsc::channel();
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        let mkdirs = Arc::new(AtomicUsize::new(0));
+        let opens = Arc::new(AtomicUsize::new(0));
+        let runtime = Arc::new(Runtime::new(PathNodeFs::new(AdmitFs {
+            entered: Mutex::new(entered),
+            released: Arc::clone(&released),
+            mkdirs: Arc::clone(&mkdirs),
+            opens: Arc::clone(&opens),
+        })));
+
+        let request = Arc::clone(&runtime);
+        let creator = thread::spawn(move || {
+            request
+                .mkdir(1, OsStr::new("new"), 0o755, 0, &Caller::default())
+                .map(|_| ())
+        });
+        prompted.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (done, answered) = mpsc::channel();
+        let request = Arc::clone(&runtime);
+        let other = thread::spawn(move || {
+            request.getattr(1, None, &Caller::default()).unwrap();
+            request.statfs(1, &Caller::default()).unwrap();
+            done.send(()).unwrap();
+        });
+        let answered = answered.recv_timeout(Duration::from_secs(5));
+        // Release before asserting, so a failure can't leave threads blocked.
+        *mutex(&released.0) = true;
+        released.1.notify_all();
+        answered.expect("getattr and statfs waited behind a blocked admit");
+        other.join().unwrap();
+        assert_eq!(creator.join().unwrap(), Ok(()));
+        assert_eq!(mkdirs.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            runtime.open(1, 0, &Caller::default()).err(),
+            Some(Errno::EACCES)
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
     }
 
     fn found(reply: LookupReply) -> u64 {
