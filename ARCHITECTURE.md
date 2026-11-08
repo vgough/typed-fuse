@@ -312,6 +312,12 @@ directory, and forget callbacks hold a shared read lock, so they may overlap wit
 not with those structural changes. Long reads or backing I/O can consequently delay a
 rename/unlink, and payloads/handles still need their own interior locking.
 
+`PathFilesystem::admit` runs before either lock is taken (and before any path is resolved), with
+the operation as a `PathOp` and the caller. It can refuse a request, or block on it, for example
+to authenticate the caller, without delaying unrelated requests. A callback that blocks under the
+write lock stalls every other request. `forget`, `release`, and `releasedir` are never admitted,
+so the filesystem always frees what they release.
+
 `PathFilesystem::rename` has no flags argument. `PathNodeFs` returns `EOPNOTSUPP` when the kernel
 passes nonzero flags. `statfs` receives `/` through the adapter. The path trait has no
 `copy_file_range`; the adapted `NodeFs` default therefore returns `ENOSYS` for it.
