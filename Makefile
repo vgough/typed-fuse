@@ -1,10 +1,28 @@
-.PHONY: test update-deps hello_ll memory_fs run_memory_fs memory_fs_release benchmark benchmark-save-baseline clean
+.PHONY: test update-deps hello_ll memory_fs run_memory_fs memory_fs_release benchmark benchmark-save-baseline clean publish publish-sys publish-core publish-typed-fuse
 
 test:
 	cargo nextest run --workspace
 
 update-deps:
 	cargo update
+
+# Publish individual crates when only some versions have changed. The combined
+# target requires all three versions to be unpublished and runs in dependency order.
+CARGO_PUBLISH_FLAGS ?=
+
+publish:
+	cargo publish -p typed-fuse-sys $(CARGO_PUBLISH_FLAGS)
+	cargo publish -p typed-fuse-core $(CARGO_PUBLISH_FLAGS)
+	cargo publish -p typed-fuse $(CARGO_PUBLISH_FLAGS)
+
+publish-sys:
+	cargo publish -p typed-fuse-sys $(CARGO_PUBLISH_FLAGS)
+
+publish-core:
+	cargo publish -p typed-fuse-core $(CARGO_PUBLISH_FLAGS)
+
+publish-typed-fuse:
+	cargo publish -p typed-fuse $(CARGO_PUBLISH_FLAGS)
 
 hello_ll:
 	cargo build -p typed-fuse-sys --example hello_ll_raw --features fuse_35

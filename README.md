@@ -82,6 +82,18 @@ If no version is selected the crate defaults to version 35.
 
 `libfuse-sys/examples/hello_ll_raw.rs` is a Rust port of libfuse's classic `hello_ll.c`.
 
+## Publishing crates
+
+After preparing the version and dependency updates, use `make publish-sys`,
+`make publish-core`, or `make publish-typed-fuse` for the crates with new
+versions. Publish dependencies before `typed-fuse` and wait for them to appear
+on crates.io. If all three versions are new, `make publish` publishes them in
+that order. Cargo credentials are required.
+
+Pass `CARGO_PUBLISH_FLAGS=--dry-run` to check a package without uploading it.
+A dry run of `typed-fuse` requires its dependency versions to be available on
+crates.io already.
+
 ## License
 
 This project is published under the MIT license, while libfuse itself is published under LGPL2+. Take special care to ensure the terms of the LGPL2+ are honored when using these crates.
