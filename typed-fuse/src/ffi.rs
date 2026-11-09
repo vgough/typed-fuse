@@ -75,11 +75,7 @@ fn raw_add_direntry_plus(
 
 /// The file handle carried in a (possibly null) `fuse_file_info`.
 pub(crate) fn fi_fh(fi: *mut fuse_file_info) -> u64 {
-    if fi.is_null() {
-        0
-    } else {
-        unsafe { (*fi).fh }
-    }
+    if fi.is_null() { 0 } else { unsafe { (*fi).fh } }
 }
 
 pub(crate) fn fi_fh_opt(fi: *mut fuse_file_info) -> Option<u64> {

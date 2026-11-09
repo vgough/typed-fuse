@@ -313,10 +313,17 @@ not with those structural changes. Long reads or backing I/O can consequently de
 rename/unlink, and payloads/handles still need their own interior locking.
 
 `PathFilesystem::admit` runs before either lock is taken (and before any path is resolved), with
-the operation as a `PathOp` and the caller. It can refuse a request, or block on it, for example
-to authenticate the caller, without delaying unrelated requests. A callback that blocks under the
-write lock stalls every other request. `forget`, `release`, and `releasedir` are never admitted,
-so the filesystem always frees what they release.
+an `Admission` describing the request: the operation as a `PathOp`, the caller, whether it
+addresses the root, the entries it names (one for an operation on an entry; a rename's source and
+then its destination), and the extended attribute name or readdir offset the kernel sent. A
+request addresses the root if its node is the root or the root holds any of its entries, so a
+root policy covers both ends of a rename. Each comes from the request itself, so building it
+needs neither lock. There is no path, which needs the namespace, and no inode number: node
+operations reach the adapter with the node rather than its number, and mapping one to the other
+needs the namespace too. It can refuse a request, or block on it, for example to authenticate
+the caller, without delaying unrelated requests. A callback that blocks under the write lock
+stalls every other request. `forget`, `release`, and `releasedir` are never
+admitted, so the filesystem always frees what they release.
 
 `PathFilesystem::rename` has no flags argument. `PathNodeFs` returns `EOPNOTSUPP` when the kernel
 passes nonzero flags. `statfs` receives `/` through the adapter. The path trait has no

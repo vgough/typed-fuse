@@ -2,8 +2,8 @@
 mod filesystem_support;
 
 use filesystem_support::{
-    calculate_deltas, ensure_compatible, load_result, parse_mdtest_output, save_result_atomic,
-    BenchmarkResult, HostContext, Workload, SCHEMA_VERSION,
+    BenchmarkResult, HostContext, SCHEMA_VERSION, Workload, calculate_deltas, ensure_compatible,
+    load_result, parse_mdtest_output, save_result_atomic,
 };
 
 const CAPTURED_MDTEST_OUTPUT: &str = include_str!("fixtures/mdtest-summary.txt");

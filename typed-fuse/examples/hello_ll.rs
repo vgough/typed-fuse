@@ -69,10 +69,10 @@ impl NodeFs for HelloFs {
             },
             NodeId::ROOT,
         );
-        if let Some(root) = cx.get(NodeId::ROOT) {
-            if let Node::Dir { entries } = &*root {
-                entries.write().unwrap().insert("hello".to_string(), hello);
-            }
+        if let Some(root) = cx.get(NodeId::ROOT)
+            && let Node::Dir { entries } = &*root
+        {
+            entries.write().unwrap().insert("hello".to_string(), hello);
         }
     }
 

@@ -1,9 +1,9 @@
 mod filesystem_support;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use filesystem_support::{
-    calculate_deltas, ensure_compatible, load_result, parse_mdtest_output, save_result_atomic,
-    workload_description, BenchmarkResult, HostContext, Workload, SCHEMA_VERSION,
+    BenchmarkResult, HostContext, SCHEMA_VERSION, Workload, calculate_deltas, ensure_compatible,
+    load_result, parse_mdtest_output, save_result_atomic, workload_description,
 };
 use std::env;
 use std::fs;

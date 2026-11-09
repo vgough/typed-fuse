@@ -147,10 +147,10 @@ impl<N> Deref for NodeRef<N> {
 impl<N> Drop for NodeRef<N> {
     fn drop(&mut self) {
         let mut table = lock(&self.shared.table);
-        if let Some(slot) = table.map.get_mut(&self.id.ino()) {
-            if Arc::ptr_eq(&slot.record, &self.record) {
-                slot.leases = slot.leases.saturating_sub(1);
-            }
+        if let Some(slot) = table.map.get_mut(&self.id.ino())
+            && Arc::ptr_eq(&slot.record, &self.record)
+        {
+            slot.leases = slot.leases.saturating_sub(1);
         }
         table.maybe_drop(self.id);
     }
@@ -500,8 +500,11 @@ impl<F: NodeFs> Runtime<F> {
             lock(&self.shared.table).maybe_drop(id);
         }
     }
-    pub fn statfs(&self, _ino: u64, caller: &Caller) -> Result<StatFs, Errno> {
-        self.fs.statfs(caller)
+    pub fn statfs(&self, ino: u64, caller: &Caller) -> Result<StatFs, Errno> {
+        // statfs has never failed for an inode the runtime doesn't know, so
+        // answer for the root instead.
+        let node = self.node(ino).or_else(|_| self.node(NodeId::ROOT.ino()))?;
+        self.fs.statfs(&node, caller)
     }
     pub fn getattr(&self, ino: u64, fh: Option<u64>, caller: &Caller) -> Result<NodeAttr, Errno> {
         let n = self.node(ino)?;

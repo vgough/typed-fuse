@@ -25,8 +25,8 @@ pub use node_fs::{
     Opened, PlusDirSink, XattrReply,
 };
 pub use path_fs::{
-    replay, DirBuffer, DirEntry, PathDirHandle, PathDirIdentity, PathDirSink, PathEntry,
-    PathFilesystem, PathNode, PathNodeFs, PathNodeRef, PathOp, PathPlusDirSink,
+    Admission, AdmissionEntry, DirBuffer, DirEntry, PathDirHandle, PathDirIdentity, PathDirSink,
+    PathEntry, PathFilesystem, PathNode, PathNodeFs, PathNodeRef, PathOp, PathPlusDirSink, replay,
 };
 pub use runtime::{
     Cx, EntryReply, LookupReply, NodeRef, NodeTable, OpenReply, Runtime, RuntimePlusSink,

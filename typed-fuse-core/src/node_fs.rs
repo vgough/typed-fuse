@@ -19,7 +19,7 @@ impl NodeId {
     pub const ROOT: NodeId = NodeId(1);
 
     /// The underlying inode number.
-    pub fn ino(self) -> u64 {
+    pub const fn ino(self) -> u64 {
         self.0
     }
 
@@ -611,9 +611,11 @@ pub trait NodeFs: Sized + Send + Sync {
         Ok(())
     }
 
-    /// Returns filesystem-wide statistics. Defaults to a minimal-but-valid
+    /// Returns filesystem-wide statistics. `node` is the node the kernel asked
+    /// about, such as the directory `df` was given; most filesystems answer
+    /// for the whole filesystem and ignore it. Defaults to a minimal-but-valid
     /// value (as libfuse does when the callback is unset).
-    fn statfs(&self, caller: &Caller) -> Result<StatFs, Errno> {
+    fn statfs(&self, node: &Self::Node, caller: &Caller) -> Result<StatFs, Errno> {
         Ok(StatFs {
             bsize: 512,
             namelen: 255,

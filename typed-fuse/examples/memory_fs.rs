@@ -545,11 +545,11 @@ impl NodeFs for MemoryFs {
             }
         }
         if let Some(replaced_entry) = replaced {
-            if replaced_entry.kind == FileKind::Directory {
-                if let Some(node) = cx.get(newparent) {
-                    let mut node = node.write();
-                    node.nlink = node.nlink.saturating_sub(1);
-                }
+            if replaced_entry.kind == FileKind::Directory
+                && let Some(node) = cx.get(newparent)
+            {
+                let mut node = node.write();
+                node.nlink = node.nlink.saturating_sub(1);
             }
             if let Some(node) = cx.get(replaced_entry.id) {
                 let mut node = node.write();
@@ -719,7 +719,12 @@ impl NodeFs for MemoryFs {
         }
     }
 
-    fn listxattr(&self, node: &Node, size: usize, _c: &Caller) -> Result<typed_fuse::XattrReply, Errno> {
+    fn listxattr(
+        &self,
+        node: &Node,
+        size: usize,
+        _c: &Caller,
+    ) -> Result<typed_fuse::XattrReply, Errno> {
         let node = node.read();
         let mut names = Vec::new();
         for name in node.xattrs.keys() {

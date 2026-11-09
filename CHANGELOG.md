@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.9.0
+
+### Breaking changes
+
+- `PathFilesystem::admit` now takes an `&Admission` instead of a `PathOp` and
+  a caller. `PathNodeFs` calls it at the same points and under the same
+  rules. Besides the operation (`Admission::op`) and caller
+  (`Admission::caller`), it carries:
+  - `Admission::entries`: the names in directories the request touches, each
+    an `AdmissionEntry` with its name and whether its directory is the root.
+    Operations on an entry carry one; `rename` carries its source and then its
+    destination, so a policy that checks every entry can't be sidestepped by
+    renaming an allowed name into a refused one.
+  - `Admission::targets_root`: whether the request addresses the root, either
+    as the node itself or as the directory holding any of its entries.
+  - The attribute name for `setxattr`, `getxattr` and `removexattr`, and the
+    offset of each `readdir` page (0 when a listing starts).
+
+  All of it comes from the request itself, so admission still runs before the
+  adapter takes a lock or resolves a path. To migrate, match on
+  `request.op()` and use `request.caller()`. `typed-fuse-core` is now 0.8.0.
+- `NodeFs::statfs` takes the node the kernel asked about, as
+  `statfs(&self, node: &Self::Node, caller)`. Most filesystems can ignore it;
+  add the parameter to migrate. If the kernel names an inode the runtime
+  doesn't know, the runtime passes the root. `PathNodeFs` admits `statfs` on
+  that node, and still calls `PathFilesystem::statfs` with `/`.
+
+### Other changes
+
+- Filesystems can build an `Admission` with `Admission::new` and its `with_*`
+  methods to test their admission policy without a runtime.
+- `NodeId::ino` is now a `const fn`.
+
 ## 0.8.4
 
 ### Other changes

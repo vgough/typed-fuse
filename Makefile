@@ -1,7 +1,13 @@
-.PHONY: test update-deps hello_ll memory_fs run_memory_fs memory_fs_release benchmark benchmark-save-baseline clean publish publish-sys publish-core publish-typed-fuse
+.PHONY: test lint update-deps hello_ll memory_fs run_memory_fs memory_fs_release benchmark benchmark-save-baseline clean publish publish-sys publish-core publish-typed-fuse
 
 test:
 	cargo nextest run --workspace
+
+lint:
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy -p typed-fuse-sys --all-targets --features fuse_31,cuse_lowlevel -- -D warnings
+	cargo clippy -p typed-fuse-sys --all-targets --features fuse_35,cuse_lowlevel -- -D warnings
+	cargo clippy -p typed-fuse-sys --all-targets --features fuse_312,cuse_lowlevel -- -D warnings
 
 update-deps:
 	cargo update

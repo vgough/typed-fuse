@@ -5,14 +5,14 @@
 //! Usage: `cargo run --example hello_ll_raw -- <mountpoint>`
 
 mod imp {
-    use typed_fuse_sys::fuse_lowlevel::*;
     use std::ffi::{CStr, CString};
     use std::mem::size_of;
     use std::os::raw::{c_char, c_int, c_void};
     use std::ptr;
+    use typed_fuse_sys::fuse_lowlevel::*;
 
     const HELLO_STR: &[u8] = b"Hello World!\n";
-    const HELLO_NAME: &[u8] = b"hello\0";
+    const HELLO_NAME: &CStr = c"hello";
 
     type Attr = stat;
     type EntryParam = fuse_entry_param;
@@ -109,7 +109,7 @@ mod imp {
 
     unsafe extern "C" fn hello_ll_lookup(req: fuse_req_t, parent: fuse_ino_t, name: *const c_char) {
         let name = unsafe { CStr::from_ptr(name) };
-        if parent != FUSE_ROOT_ID as fuse_ino_t || name.to_bytes_with_nul() != HELLO_NAME {
+        if parent != FUSE_ROOT_ID as fuse_ino_t || name != HELLO_NAME {
             unsafe { fuse_reply_err(req, libc::ENOENT) };
             return;
         }
@@ -180,19 +180,9 @@ mod imp {
 
         let mut buf = Vec::new();
         unsafe {
-            dirbuf_add(req, &mut buf, CStr::from_bytes_with_nul(b".\0").unwrap(), 1);
-            dirbuf_add(
-                req,
-                &mut buf,
-                CStr::from_bytes_with_nul(b"..\0").unwrap(),
-                1,
-            );
-            dirbuf_add(
-                req,
-                &mut buf,
-                CStr::from_bytes_with_nul(HELLO_NAME).unwrap(),
-                2,
-            );
+            dirbuf_add(req, &mut buf, c".", 1);
+            dirbuf_add(req, &mut buf, c"..", 1);
+            dirbuf_add(req, &mut buf, HELLO_NAME, 2);
             reply_buf_limited(req, &buf, off, size);
         }
     }
@@ -358,11 +348,7 @@ mod imp {
         }
         unsafe { fuse_opt_free_args(&mut args) };
 
-        if ret != 0 {
-            1
-        } else {
-            0
-        }
+        if ret != 0 { 1 } else { 0 }
     }
 }
 
