@@ -246,7 +246,8 @@ pub fn replay(offset: u64, len: usize, mut emit: impl FnMut(usize, u64) -> bool)
     }
 }
 
-/// The operation a request asks for, as passed to [`PathFilesystem::admit`].
+/// The operation a request asks for, as seen by
+/// [`PathFilesystem::admit`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PathOp {
@@ -282,6 +283,173 @@ pub enum PathOp {
     Getlk,
     Setlk,
     Flock,
+}
+
+/// A request as [`PathFilesystem::admit`] sees it, before the adapter
+/// takes any of its locks or resolves a path. It carries what the adapter
+/// knows from the request itself, without the locks: which operation, who
+/// asked, whether it addresses the root, and the names and offset the kernel
+/// sent.
+///
+/// | Operation | Addresses | [`entries`](Self::entries) | [`xattr_name`](Self::xattr_name) | [`offset`](Self::offset) |
+/// |---|---|---|---|---|
+/// | `Lookup`, `Mknod`, `Mkdir`, `Symlink`, `Unlink`, `Rmdir`, `Create` | the entry's parent directory | the entry | - | - |
+/// | `Rename` | both entries' parent directories | the source, then the destination | - | - |
+/// | `Link` | the new entry's parent directory | the new entry | - | - |
+/// | `Setxattr`, `Getxattr`, `Removexattr` | the node | - | the attribute's name | - |
+/// | `Readdir` (`readdir` and `readdirplus`, once per page) | the directory | - | - | the page's offset |
+/// | Every other operation | the node | - | - | - |
+///
+/// A policy on names should check every entry, and one on the root can use
+/// [`targets_root`](Self::targets_root), which covers both ends of a
+/// `Rename`. Either way a refused name or directory can't be reached by
+/// creating an allowed one and renaming it.
+///
+/// There is no path, since building one needs the adapter's namespace, which
+/// admission runs without. Nor is there an inode number: the adapter receives
+/// a node operation's node rather than its number, and finding the number
+/// needs the namespace too.
+///
+/// Filesystems can build one with [`Admission::new`] and the `with_*` methods
+/// to test their admission policy without a runtime.
+#[derive(Clone)]
+pub struct Admission<'a> {
+    op: PathOp,
+    caller: &'a Caller,
+    node_is_root: bool,
+    entries: [AdmissionEntry<'a>; 2],
+    entry_count: usize,
+    xattr_name: Option<&'a OsStr>,
+    offset: Option<u64>,
+}
+
+impl std::fmt::Debug for Admission<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Admission")
+            .field("op", &self.op)
+            .field("caller", &self.caller)
+            .field("node_is_root", &self.node_is_root)
+            .field("entries", &self.entries())
+            .field("xattr_name", &self.xattr_name)
+            .field("offset", &self.offset)
+            .finish()
+    }
+}
+
+/// A name in a directory that an [`Admission`] carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionEntry<'a> {
+    parent_is_root: bool,
+    name: &'a OsStr,
+}
+
+impl<'a> AdmissionEntry<'a> {
+    /// Whether the directory holding the entry is the root.
+    pub fn parent_is_root(&self) -> bool {
+        self.parent_is_root
+    }
+
+    /// The entry's name.
+    pub fn name(&self) -> &'a OsStr {
+        self.name
+    }
+}
+
+impl<'a> Admission<'a> {
+    /// A request for `op` from `caller`, addressing a node other than the
+    /// root and carrying no entries, attribute name or offset.
+    pub fn new(op: PathOp, caller: &'a Caller) -> Self {
+        let none = AdmissionEntry {
+            parent_is_root: false,
+            name: OsStr::new(""),
+        };
+        Self {
+            op,
+            caller,
+            node_is_root: false,
+            entries: [none; 2],
+            entry_count: 0,
+            xattr_name: None,
+            offset: None,
+        }
+    }
+
+    /// Sets whether the node an operation on a node addresses is the root.
+    pub fn with_root(mut self, node_is_root: bool) -> Self {
+        self.node_is_root = node_is_root;
+        self
+    }
+
+    /// Adds an entry the request carries: its name, and whether the directory
+    /// holding it is the root. A `Rename` adds its source, then its
+    /// destination.
+    ///
+    /// # Panics
+    ///
+    /// If the request already carries two entries, the most any request
+    /// carries.
+    pub fn with_entry(mut self, parent_is_root: bool, name: &'a OsStr) -> Self {
+        assert!(
+            self.entry_count < self.entries.len(),
+            "a request carries at most two entries"
+        );
+        self.entries[self.entry_count] = AdmissionEntry {
+            parent_is_root,
+            name,
+        };
+        self.entry_count += 1;
+        self
+    }
+
+    /// Sets the extended attribute name the request carries.
+    pub fn with_xattr_name(mut self, name: &'a OsStr) -> Self {
+        self.xattr_name = Some(name);
+        self
+    }
+
+    /// Sets the directory offset the request carries.
+    pub fn with_offset(mut self, offset: u64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    /// The operation requested.
+    pub fn op(&self) -> PathOp {
+        self.op
+    }
+
+    /// Who made the request.
+    pub fn caller(&self) -> &'a Caller {
+        self.caller
+    }
+
+    /// Whether the request addresses the root directory: the node itself is
+    /// the root, or the root holds one of its [`entries`](Self::entries). A
+    /// `Rename` addresses the root if it moves an entry out of or into it.
+    pub fn targets_root(&self) -> bool {
+        self.node_is_root || self.entries().iter().any(|e| e.parent_is_root)
+    }
+
+    /// The names in directories the request carries, in the order the table
+    /// above gives: one for operations on an entry, the source and then the
+    /// destination for `Rename`, and none for the rest.
+    pub fn entries(&self) -> &[AdmissionEntry<'a>] {
+        &self.entries[..self.entry_count]
+    }
+
+    /// The extended attribute name, for `Setxattr`, `Getxattr` and
+    /// `Removexattr`.
+    pub fn xattr_name(&self) -> Option<&'a OsStr> {
+        self.xattr_name
+    }
+
+    /// The offset a `Readdir` page starts at. It is 0 when a listing starts,
+    /// which is when the adapter reads the directory. A later page normally
+    /// resumes that listing, but the adapter reads the directory again if it
+    /// has evicted the listing a page would resume and has no other.
+    pub fn offset(&self) -> Option<u64> {
+        self.offset
+    }
 }
 
 /// A synchronous path-based filesystem interface.
@@ -332,7 +500,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     ///
     /// Not called for `forget`, `release` or `releasedir`, which must always
     /// reach the filesystem so it can free what they release.
-    fn admit(&self, op: PathOp, caller: &Caller) -> Result<(), Errno> {
+    fn admit(&self, request: &Admission<'_>) -> Result<(), Errno> {
         Ok(())
     }
 
@@ -651,7 +819,7 @@ pub trait PathFilesystem: Send + Sync + Sized {
     }
 
     /// Atomically creates and opens a regular file named `name` in `parent`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn create(
         &self,
         parent: PathNodeRef<'_, Self::NodeState>,
@@ -743,6 +911,10 @@ pub struct PathNode<S> {
     entries_epoch: AtomicU64,
 }
 
+/// The key of the root's [`PathNode`]. It is the root's [`NodeId`] number, so
+/// the root has the same number as a key and as a runtime id.
+const ROOT_KEY: u64 = NodeId::ROOT.ino();
+
 impl<S> PathNode<S> {
     fn new(key: u64, state: Arc<S>) -> Self {
         Self {
@@ -751,6 +923,11 @@ impl<S> PathNode<S> {
             entry_attr: Mutex::new(None),
             entries_epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Whether this is the root, known without the namespace.
+    fn is_root(&self) -> bool {
+        self.key == ROOT_KEY
     }
 
     /// Records a change to this directory's names. Callers hold the
@@ -771,6 +948,22 @@ impl<S> PathNode<S> {
     fn take_entry_attr(&self) -> Option<NodeAttr> {
         mutex(&self.entry_attr).take()
     }
+}
+
+/// The admission for `op` on `node`, which addresses the root when `node` is
+/// the root.
+fn node_admission<'a, S>(op: PathOp, node: &PathNode<S>, caller: &'a Caller) -> Admission<'a> {
+    Admission::new(op, caller).with_root(node.is_root())
+}
+
+/// The admission for `op` on the entry `name` in directory `parent`.
+fn entry_admission<'a>(
+    op: PathOp,
+    parent: NodeId,
+    name: &'a OsStr,
+    caller: &'a Caller,
+) -> Admission<'a> {
+    Admission::new(op, caller).with_entry(parent == NodeId::ROOT, name)
 }
 
 impl<S> std::fmt::Debug for PathNode<S> {
@@ -803,12 +996,12 @@ struct Namespace {
 impl Namespace {
     fn new() -> Self {
         let mut keys = BTreeMap::new();
-        keys.insert(1, NodeId::ROOT);
+        keys.insert(ROOT_KEY, NodeId::ROOT);
         Self {
             by_name: BTreeMap::new(),
             aliases: BTreeMap::new(),
             keys,
-            next_key: 2,
+            next_key: ROOT_KEY + 1,
         }
     }
 
@@ -997,6 +1190,27 @@ pub struct PathNodeFs<P> {
 }
 
 impl<P: PathFilesystem> PathNodeFs<P> {
+    /// Admits `op` on `node`; see [`node_admission`].
+    fn admit_node(
+        &self,
+        op: PathOp,
+        node: &PathNode<P::NodeState>,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
+        self.inner.admit(&node_admission(op, node, caller))
+    }
+
+    /// Admits `op` on the entry `name` in `parent`; see [`entry_admission`].
+    fn admit_entry(
+        &self,
+        op: PathOp,
+        parent: NodeId,
+        name: &OsStr,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
+        self.inner.admit(&entry_admission(op, parent, name, caller))
+    }
+
     /// Wraps `inner` for use with the node-based [`Runtime`](crate::Runtime).
     pub fn new(inner: P) -> Self {
         Self {
@@ -1214,7 +1428,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     const SUPPORTS_READDIRPLUS: bool = P::SUPPORTS_READDIRPLUS;
 
     fn root(&mut self) -> Self::Node {
-        PathNode::new(1, self.inner.root_state())
+        PathNode::new(ROOT_KEY, self.inner.root_state())
     }
     fn init(&self, conn: &mut ConnInfo) {
         self.inner.init(conn)
@@ -1237,7 +1451,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         handle: Option<&P::Handle>,
         caller: &Caller,
     ) -> Result<NodeAttr, Errno> {
-        self.inner.admit(PathOp::Getattr, caller)?;
+        self.admit_node(PathOp::Getattr, node, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node);
         self.inner.getattr(
@@ -1269,7 +1483,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         set: &SetAttr,
         caller: &Caller,
     ) -> Result<NodeAttr, Errno> {
-        self.inner.admit(PathOp::Setattr, caller)?;
+        self.admit_node(PathOp::Setattr, node, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node);
         self.inner.setattr(
@@ -1294,7 +1508,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         name: &OsStr,
         caller: &Caller,
     ) -> Result<Option<NodeId>, Errno> {
-        self.inner.admit(PathOp::Lookup, caller)?;
+        self.admit_entry(PathOp::Lookup, parent, name, caller)?;
         let _guard = read_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         let parent_path = self.path(parent)?;
@@ -1313,7 +1527,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
     }
 
     fn readlink(&self, node: &PathNode<P::NodeState>, caller: &Caller) -> Result<PathBuf, Errno> {
-        self.inner.admit(PathOp::Readlink, caller)?;
+        self.admit_node(PathOp::Readlink, node, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.readlink(
@@ -1335,7 +1549,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         umask: u32,
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
-        self.inner.admit(PathOp::Mknod, caller)?;
+        self.admit_entry(PathOp::Mknod, parent, name, caller)?;
         let _guard = write_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         parent_node.entries_changed();
@@ -1351,7 +1565,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
             umask,
             caller,
         )?;
-        Ok(self.add_node(cx, parent, name, entry)?)
+        self.add_node(cx, parent, name, entry)
     }
 
     fn mkdir(
@@ -1363,7 +1577,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         umask: u32,
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
-        self.inner.admit(PathOp::Mkdir, caller)?;
+        self.admit_entry(PathOp::Mkdir, parent, name, caller)?;
         let _guard = write_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         parent_node.entries_changed();
@@ -1378,7 +1592,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
             umask,
             caller,
         )?;
-        Ok(self.add_node(cx, parent, name, entry)?)
+        self.add_node(cx, parent, name, entry)
     }
 
     fn symlink(
@@ -1389,7 +1603,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         target: &Path,
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
-        self.inner.admit(PathOp::Symlink, caller)?;
+        self.admit_entry(PathOp::Symlink, parent, name, caller)?;
         let _guard = write_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         parent_node.entries_changed();
@@ -1403,7 +1617,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
             target,
             caller,
         )?;
-        Ok(self.add_node(cx, parent, name, entry)?)
+        self.add_node(cx, parent, name, entry)
     }
 
     fn unlink(
@@ -1413,7 +1627,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         name: &OsStr,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        self.inner.admit(PathOp::Unlink, caller)?;
+        self.admit_entry(PathOp::Unlink, parent, name, caller)?;
         self.remove_entry(cx, parent, name, caller, false)
     }
 
@@ -1424,7 +1638,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         name: &OsStr,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        self.inner.admit(PathOp::Rmdir, caller)?;
+        self.admit_entry(PathOp::Rmdir, parent, name, caller)?;
         self.remove_entry(cx, parent, name, caller, true)
     }
 
@@ -1441,7 +1655,10 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         if flags != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
-        self.inner.admit(PathOp::Rename, caller)?;
+        self.inner.admit(
+            &entry_admission(PathOp::Rename, parent, name, caller)
+                .with_entry(newparent == NodeId::ROOT, newname),
+        )?;
         let _guard = write_lock(&self.operations);
         let old_parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         let new_parent_node = cx.get(newparent).ok_or(Errno::ENOENT)?;
@@ -1494,7 +1711,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         newname: &OsStr,
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
-        self.inner.admit(PathOp::Link, caller)?;
+        self.admit_entry(PathOp::Link, newparent, newname, caller)?;
         let _guard = write_lock(&self.operations);
         let source_node = cx.get(id).ok_or(Errno::ENOENT)?;
         let parent_node = cx.get(newparent).ok_or(Errno::ENOENT)?;
@@ -1528,7 +1745,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         flags: i32,
         caller: &Caller,
     ) -> Result<Opened<P::Handle>, Errno> {
-        self.inner.admit(PathOp::Open, caller)?;
+        self.admit_node(PathOp::Open, node, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.open(
@@ -1549,7 +1766,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         size: usize,
         caller: &Caller,
     ) -> Result<Cow<'a, [u8]>, Errno> {
-        self.inner.admit(PathOp::Read, caller)?;
+        self.admit_node(PathOp::Read, node, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node);
         self.inner.read(
@@ -1572,7 +1789,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         offset: u64,
         caller: &Caller,
     ) -> Result<usize, Errno> {
-        self.inner.admit(PathOp::Write, caller)?;
+        self.admit_node(PathOp::Write, node, caller)?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node);
         self.inner.write(
@@ -1593,7 +1810,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         handle: &P::Handle,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        self.inner.admit(PathOp::Flush, caller)?;
+        self.admit_node(PathOp::Flush, node, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.flush(
@@ -1629,7 +1846,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         datasync: bool,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        self.inner.admit(PathOp::Fsync, caller)?;
+        self.admit_node(PathOp::Fsync, node, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.fsync(
@@ -1649,7 +1866,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         flags: i32,
         caller: &Caller,
     ) -> Result<Opened<PathDirHandle<P>>, Errno> {
-        self.inner.admit(PathOp::Opendir, caller)?;
+        self.admit_node(PathOp::Opendir, node, caller)?;
         let _g = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         let opened = self.inner.opendir(
@@ -1680,7 +1897,8 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         sink: &mut dyn DirSink,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        self.inner.admit(PathOp::Readdir, caller)?;
+        self.inner
+            .admit(&node_admission(PathOp::Readdir, node, caller).with_offset(offset))?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         let DirRead::Listing {
@@ -1723,7 +1941,8 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         sink: &mut dyn PlusDirSink,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        self.inner.admit(PathOp::Readdir, caller)?;
+        self.inner
+            .admit(&node_admission(PathOp::Readdir, node, caller).with_offset(offset))?;
         let _guard = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         let DirRead::Listing {
@@ -1783,7 +2002,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         datasync: bool,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        self.inner.admit(PathOp::Fsyncdir, caller)?;
+        self.admit_node(PathOp::Fsyncdir, node, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.fsyncdir(
@@ -1796,8 +2015,8 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
             caller,
         )
     }
-    fn statfs(&self, caller: &Caller) -> Result<StatFs, Errno> {
-        self.inner.admit(PathOp::Statfs, caller)?;
+    fn statfs(&self, node: &PathNode<P::NodeState>, caller: &Caller) -> Result<StatFs, Errno> {
+        self.admit_node(PathOp::Statfs, node, caller)?;
         let _g = read_lock(&self.operations);
         self.inner.statfs(Path::new("/"), caller)
     }
@@ -1810,7 +2029,8 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         flags: i32,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        self.inner.admit(PathOp::Setxattr, caller)?;
+        self.inner
+            .admit(&node_admission(PathOp::Setxattr, node, caller).with_xattr_name(name))?;
         let _g = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.setxattr(
@@ -1831,7 +2051,8 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         size: usize,
         caller: &Caller,
     ) -> Result<XattrReply, Errno> {
-        self.inner.admit(PathOp::Getxattr, caller)?;
+        self.inner
+            .admit(&node_admission(PathOp::Getxattr, node, caller).with_xattr_name(name))?;
         let _g = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.getxattr(
@@ -1850,7 +2071,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         size: usize,
         caller: &Caller,
     ) -> Result<XattrReply, Errno> {
-        self.inner.admit(PathOp::Listxattr, caller)?;
+        self.admit_node(PathOp::Listxattr, node, caller)?;
         let _g = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.listxattr(
@@ -1868,7 +2089,8 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         name: &OsStr,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        self.inner.admit(PathOp::Removexattr, caller)?;
+        self.inner
+            .admit(&node_admission(PathOp::Removexattr, node, caller).with_xattr_name(name))?;
         let _g = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.removexattr(
@@ -1886,7 +2108,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         mask: i32,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        self.inner.admit(PathOp::Access, caller)?;
+        self.admit_node(PathOp::Access, node, caller)?;
         let _g = read_lock(&self.operations);
         let path = self.node_path(node).ok_or(Errno::ENOENT)?;
         self.inner.access(
@@ -1909,7 +2131,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         flags: i32,
         caller: &Caller,
     ) -> Result<(NodeId, Opened<P::Handle>), Errno> {
-        self.inner.admit(PathOp::Create, caller)?;
+        self.admit_entry(PathOp::Create, parent, name, caller)?;
         let _g = write_lock(&self.operations);
         let parent_node = cx.get(parent).ok_or(Errno::ENOENT)?;
         parent_node.entries_changed();
@@ -1936,7 +2158,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         length: u64,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        self.inner.admit(PathOp::Fallocate, caller)?;
+        self.admit_node(PathOp::Fallocate, node, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.fallocate(
@@ -1959,7 +2181,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         whence: i32,
         caller: &Caller,
     ) -> Result<u64, Errno> {
-        self.inner.admit(PathOp::Lseek, caller)?;
+        self.admit_node(PathOp::Lseek, node, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.lseek(
@@ -1981,7 +2203,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         lock: FileLock,
         caller: &Caller,
     ) -> Result<FileLock, Errno> {
-        self.inner.admit(PathOp::Getlk, caller)?;
+        self.admit_node(PathOp::Getlk, node, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.getlk(
@@ -2004,7 +2226,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         sleep: bool,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        self.inner.admit(PathOp::Setlk, caller)?;
+        self.admit_node(PathOp::Setlk, node, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.setlk(
@@ -2026,7 +2248,7 @@ impl<P: PathFilesystem> NodeFs for PathNodeFs<P> {
         operation: i32,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        self.inner.admit(PathOp::Flock, caller)?;
+        self.admit_node(PathOp::Flock, node, caller)?;
         let _g = read_lock(&self.operations);
         let p = self.node_path(node);
         self.inner.flock(
@@ -2185,6 +2407,46 @@ mod tests {
         fsyncdir_handles: Arc<Mutex<Vec<usize>>>,
         /// The handle passed to each `releasedir`.
         releasedir_handles: Arc<Mutex<Vec<usize>>>,
+        /// What `admit` saw of each request, in call order.
+        admissions: Arc<Mutex<Vec<Admitted>>>,
+    }
+
+    /// What `admit` saw of one request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Admitted {
+        op: PathOp,
+        root: bool,
+        /// Each entry's parent-is-root flag and name.
+        entries: Vec<(bool, OsString)>,
+        xattr_name: Option<OsString>,
+        offset: Option<u64>,
+    }
+
+    impl Admitted {
+        fn new(op: PathOp, root: bool) -> Self {
+            Self {
+                op,
+                root,
+                entries: Vec::new(),
+                xattr_name: None,
+                offset: None,
+            }
+        }
+
+        fn entry(mut self, parent_is_root: bool, name: &str) -> Self {
+            self.entries.push((parent_is_root, name.into()));
+            self
+        }
+
+        fn xattr_name(mut self, name: &str) -> Self {
+            self.xattr_name = Some(name.into());
+            self
+        }
+
+        fn offset(mut self, offset: u64) -> Self {
+            self.offset = Some(offset);
+            self
+        }
     }
 
     impl Default for RecordingFs {
@@ -2209,6 +2471,7 @@ mod tests {
                 dir_handle: 41,
                 fsyncdir_handles: Arc::default(),
                 releasedir_handles: Arc::default(),
+                admissions: Arc::default(),
             }
         }
     }
@@ -2222,6 +2485,21 @@ mod tests {
 
         fn root_state(&mut self) -> Arc<Self::NodeState> {
             Arc::new(0)
+        }
+
+        fn admit(&self, request: &Admission<'_>) -> Result<(), Errno> {
+            mutex(&self.admissions).push(Admitted {
+                op: request.op(),
+                root: request.targets_root(),
+                entries: request
+                    .entries()
+                    .iter()
+                    .map(|e| (e.parent_is_root(), e.name().to_os_string()))
+                    .collect(),
+                xattr_name: request.xattr_name().map(OsStr::to_os_string),
+                offset: request.offset(),
+            });
+            Ok(())
         }
 
         fn lookup(
@@ -2418,8 +2696,8 @@ mod tests {
             Arc::new(())
         }
 
-        fn admit(&self, op: PathOp, _caller: &Caller) -> Result<(), Errno> {
-            match op {
+        fn admit(&self, request: &Admission<'_>) -> Result<(), Errno> {
+            match request.op() {
                 PathOp::Mkdir => {
                     mutex(&self.entered).send(()).unwrap();
                     let (released, cvar) = &*self.released;
@@ -2508,6 +2786,131 @@ mod tests {
             Some(Errno::EACCES)
         );
         assert_eq!(opens.load(Ordering::SeqCst), 0);
+    }
+
+    /// Each request reaches `admit` with what it addresses and the
+    /// names and offset it carries, taken from the request alone.
+    #[test]
+    fn admit_sees_the_target_names_and_offset() {
+        use PathOp::*;
+        let recording = RecordingFs::default();
+        let admissions = Arc::clone(&recording.admissions);
+        let runtime = Runtime::new(PathNodeFs::new(recording));
+        let caller = Caller::default();
+        let take = || std::mem::take(&mut *mutex(&admissions));
+        let name = OsStr::new;
+
+        let child = found(runtime.lookup(1, name("child"), &caller).unwrap());
+        assert_eq!(take(), [Admitted::new(Lookup, true).entry(true, "child")]);
+
+        // Attribute requests carry the attribute name, and address the root
+        // only on the root.
+        let _ = runtime.getxattr(1, name("user.a"), 0, &caller);
+        let _ = runtime.setxattr(1, name("user.b"), b"v", 0, &caller);
+        let _ = runtime.removexattr(1, name("user.c"), &caller);
+        let _ = runtime.getxattr(child, name("user.d"), 0, &caller);
+        let _ = runtime.listxattr(1, 0, &caller);
+        assert_eq!(
+            take(),
+            [
+                Admitted::new(Getxattr, true).xattr_name("user.a"),
+                Admitted::new(Setxattr, true).xattr_name("user.b"),
+                Admitted::new(Removexattr, true).xattr_name("user.c"),
+                Admitted::new(Getxattr, false).xattr_name("user.d"),
+                Admitted::new(Listxattr, true),
+            ]
+        );
+
+        // Entry operations address the parent and carry the entry. Statfs
+        // addresses the node the kernel asked about.
+        let _ = runtime.create(child, name("file"), 0o644, 0, 0, &caller);
+        let _ = runtime.mkdir(1, name("dir"), 0o755, 0, &caller);
+        let _ = runtime.link(child, 1, name("alias"), &caller);
+        let _ = runtime.rename(1, name("alias"), child, name("moved"), 0, &caller);
+        let _ = runtime.getattr(child, None, &caller);
+        let _ = runtime.statfs(1, &caller);
+        let _ = runtime.statfs(child, &caller);
+        assert_eq!(
+            take(),
+            [
+                Admitted::new(Create, false).entry(false, "file"),
+                Admitted::new(Mkdir, true).entry(true, "dir"),
+                Admitted::new(Link, true).entry(true, "alias"),
+                // The link's reply reads the linked node's attributes.
+                Admitted::new(Getattr, false),
+                Admitted::new(Rename, true)
+                    .entry(true, "alias")
+                    .entry(false, "moved"),
+                Admitted::new(Getattr, false),
+                Admitted::new(Statfs, true),
+                Admitted::new(Statfs, false),
+            ]
+        );
+
+        // A rename into the root addresses the root and carries its
+        // destination after its source, so a policy on names or the root
+        // sees where the source ends up.
+        let _ = runtime.rename(child, name("moved"), 1, name(".secret"), 0, &caller);
+        assert_eq!(
+            take(),
+            [Admitted::new(Rename, true)
+                .entry(false, "moved")
+                .entry(true, ".secret")]
+        );
+
+        // Each page of a listing carries its offset: 0 where it starts.
+        let open = runtime.opendir(1, 0, &caller).unwrap();
+        let mut first = CollectingSink::default();
+        runtime.readdir(1, open.fh, 0, &mut first, &caller).unwrap();
+        let next = first.seen[0].2;
+        runtime
+            .readdir(1, open.fh, next, &mut CollectingSink::default(), &caller)
+            .unwrap();
+        assert_eq!(
+            take(),
+            [
+                Admitted::new(Opendir, true),
+                Admitted::new(Readdir, true).offset(0),
+                Admitted::new(Readdir, true).offset(next),
+            ]
+        );
+    }
+
+    /// An admission built without a runtime addresses the root through its
+    /// node or any of its entries, and keeps the entries in order.
+    #[test]
+    fn admission_targets_root_through_any_entry() {
+        let caller = Caller::default();
+        let name = OsStr::new;
+        let rename = Admission::new(PathOp::Rename, &caller)
+            .with_entry(false, name("from"))
+            .with_entry(true, name("to"));
+        assert!(rename.targets_root());
+        let names: Vec<_> = rename.entries().iter().map(|e| e.name()).collect();
+        assert_eq!(names, [name("from"), name("to")]);
+
+        let nested = Admission::new(PathOp::Mkdir, &caller).with_entry(false, name("dir"));
+        assert!(!nested.targets_root());
+        assert!(
+            Admission::new(PathOp::Getattr, &caller)
+                .with_root(true)
+                .targets_root()
+        );
+        assert!(
+            Admission::new(PathOp::Getattr, &caller)
+                .entries()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "at most two entries")]
+    fn admission_refuses_a_third_entry() {
+        let caller = Caller::default();
+        let _ = Admission::new(PathOp::Rename, &caller)
+            .with_entry(false, OsStr::new("a"))
+            .with_entry(false, OsStr::new("b"))
+            .with_entry(false, OsStr::new("c"));
     }
 
     fn found(reply: LookupReply) -> u64 {

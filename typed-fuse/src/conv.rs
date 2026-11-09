@@ -11,14 +11,14 @@ use std::os::raw::c_int;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use libfuse_sys::fuse_lowlevel::{
-    fuse_entry_param, stat, FUSE_SET_ATTR_ATIME, FUSE_SET_ATTR_ATIME_NOW, FUSE_SET_ATTR_GID,
-    FUSE_SET_ATTR_MODE, FUSE_SET_ATTR_MTIME, FUSE_SET_ATTR_MTIME_NOW, FUSE_SET_ATTR_SIZE,
-    FUSE_SET_ATTR_UID,
+    FUSE_SET_ATTR_ATIME, FUSE_SET_ATTR_ATIME_NOW, FUSE_SET_ATTR_GID, FUSE_SET_ATTR_MODE,
+    FUSE_SET_ATTR_MTIME, FUSE_SET_ATTR_MTIME_NOW, FUSE_SET_ATTR_SIZE, FUSE_SET_ATTR_UID,
+    fuse_entry_param, stat,
 };
 #[cfg(target_os = "macos")]
-use libfuse_sys::fuse_lowlevel::{statfs, timespec, FUSE_SET_ATTR_BTIME, FUSE_SET_ATTR_CTIME};
+use libfuse_sys::fuse_lowlevel::{FUSE_SET_ATTR_BTIME, FUSE_SET_ATTR_CTIME, statfs, timespec};
 #[cfg(not(target_os = "macos"))]
-use libfuse_sys::fuse_lowlevel::{statvfs, FUSE_SET_ATTR_CTIME};
+use libfuse_sys::fuse_lowlevel::{FUSE_SET_ATTR_CTIME, statvfs};
 
 use typed_fuse_core::{FileKind, NodeAttr, SetAttr, StatFs, TimeOrNow};
 

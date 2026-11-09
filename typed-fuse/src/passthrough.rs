@@ -287,9 +287,8 @@ pub mod freebsd_xattr {
         } else {
             (buf.as_mut_ptr() as *mut libc::c_void, buf.len())
         };
-        let ret = unsafe {
-            libc::extattr_get_link(path.as_ptr(), namespace, bare.as_ptr(), ptr, size)
-        };
+        let ret =
+            unsafe { libc::extattr_get_link(path.as_ptr(), namespace, bare.as_ptr(), ptr, size) };
         if ret < 0 {
             Err(std::io::Error::last_os_error().into())
         } else {
@@ -300,8 +299,7 @@ pub mod freebsd_xattr {
     /// `extattr_delete_link`.
     pub fn removexattr(path: &CStr, name: &CStr) -> Result<(), Errno> {
         let (namespace, bare) = split_namespace(name.to_bytes())?;
-        let ret =
-            unsafe { libc::extattr_delete_link(path.as_ptr(), namespace, bare.as_ptr()) };
+        let ret = unsafe { libc::extattr_delete_link(path.as_ptr(), namespace, bare.as_ptr()) };
         if ret == 0 {
             Ok(())
         } else {
@@ -334,11 +332,14 @@ pub mod freebsd_xattr {
     }
 
     /// Read one namespace's list and append it to `out`, prefixed.
-    fn append_namespace(path: &CStr, namespace: libc::c_int, prefix: &[u8], out: &mut Vec<u8>)
-        -> Result<(), Errno> {
-        let size = unsafe {
-            libc::extattr_list_link(path.as_ptr(), namespace, std::ptr::null_mut(), 0)
-        };
+    fn append_namespace(
+        path: &CStr,
+        namespace: libc::c_int,
+        prefix: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), Errno> {
+        let size =
+            unsafe { libc::extattr_list_link(path.as_ptr(), namespace, std::ptr::null_mut(), 0) };
         if size < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -788,11 +789,7 @@ pub fn chmod_path(path: &Path, mode: u32) -> Result<(), Errno> {
 /// the id unchanged (the chown(2) `-1` convention).
 pub fn chown_fd(fd: RawFd, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
     let ret = unsafe { libc::fchown(fd, uid.unwrap_or(u32::MAX), gid.unwrap_or(u32::MAX)) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(last_errno())
-    }
+    if ret == 0 { Ok(()) } else { Err(last_errno()) }
 }
 
 /// Change owner/group of a path without following symlinks (`lchown`).
@@ -806,11 +803,7 @@ pub fn chown_path(path: &Path, uid: Option<u32>, gid: Option<u32>) -> Result<(),
             gid.unwrap_or(u32::MAX),
         )
     };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(last_errno())
-    }
+    if ret == 0 { Ok(()) } else { Err(last_errno()) }
 }
 
 fn to_timespec(t: Option<SystemTime>) -> libc::timespec {
@@ -863,11 +856,7 @@ pub fn utimens_path(
             libc::AT_SYMLINK_NOFOLLOW,
         )
     };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(last_errno())
-    }
+    if ret == 0 { Ok(()) } else { Err(last_errno()) }
 }
 
 /// Create a filesystem node: FIFO, character/block device, or socket,
@@ -888,11 +877,7 @@ pub fn mknod(path: &Path, mode: u32, rdev: u32) -> Result<(), Errno> {
     } else {
         return Err(Errno::EINVAL);
     };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(last_errno())
-    }
+    if ret == 0 { Ok(()) } else { Err(last_errno()) }
 }
 
 /// Create a symlink at `link` pointing to `target`, an arbitrary byte string
@@ -903,11 +888,7 @@ pub fn symlink(target: &OsStr, link: &Path) -> Result<(), Errno> {
     let c_target = CString::new(target.as_bytes()).map_err(|_| Errno::EINVAL)?;
     let c_link = c_path(link)?;
     let ret = unsafe { libc::symlink(c_target.as_ptr(), c_link.as_ptr()) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(last_errno())
-    }
+    if ret == 0 { Ok(()) } else { Err(last_errno()) }
 }
 
 // ---------------------------------------------------------------------------
