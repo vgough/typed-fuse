@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
 
 - Mounted requests carry a session-local `Caller::correlation_id` through
   admission and filesystem handlers. Complete `Caller` struct literals must
