@@ -27,6 +27,7 @@
 //! level, libfuse actually passes a vanilla `stat*`, which `setattr_shim`
 //! reinterprets.
 
+use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr};
 use std::marker::PhantomData;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -519,17 +520,28 @@ unsafe extern "C" fn read_shim<F: NodeFs>(
     let state = state_of::<F>(req);
     let rt = &state.runtime;
     let caller = caller_of(req, state);
+    // Any reply frees `req`, and `Runtime::read` releases its leases after
+    // the reply runs, so a panic can arrive after `req` is gone. Only the
+    // reply closure itself may answer once it has started.
+    let replied = Cell::new(false);
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        rt.read(ino, fh, off as u64, size, &caller, |result| match result {
-            Ok(data) => {
-                let len = data.len().min(size);
-                unsafe { fuse_reply_buf(req, data[..len].as_ptr() as *const c_char, len) };
+        rt.read(ino, fh, off as u64, size, &caller, |result| {
+            replied.set(true);
+            match result {
+                Ok(data) => {
+                    let len = data.len().min(size);
+                    unsafe { fuse_reply_buf(req, data[..len].as_ptr() as *const c_char, len) };
+                }
+                Err(e) => reply_err(req, e),
             }
-            Err(e) => reply_err(req, e),
         })
     }));
     if result.is_err() {
-        reply_err(req, Errno::EIO);
+        if replied.get() {
+            eprintln!("fuse3: read panicked after replying; the reply already sent stands");
+        } else {
+            reply_err(req, Errno::EIO);
+        }
     }
 }
 

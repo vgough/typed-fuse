@@ -131,6 +131,14 @@ struct LookupIds {
     handled: Vec<NonZeroU64>,
 }
 
+/// The names the correlation test looks up; lookups of anything else, such
+/// as a desktop indexer's probes, are not recorded.
+const PROBED: [&str; 2] = ["first", "second"];
+
+fn is_probed(name: &OsStr) -> bool {
+    PROBED.iter().any(|p| name == OsStr::new(p))
+}
+
 struct CorrelatingFs {
     inner: ReadOnlyPathFs,
     ids: Arc<Mutex<LookupIds>>,
@@ -146,7 +154,7 @@ impl PathFilesystem for CorrelatingFs {
     }
 
     fn admit(&self, request: &Admission<'_>) -> Result<(), Errno> {
-        if request.op() == PathOp::Lookup {
+        if request.op() == PathOp::Lookup && request.entries().iter().any(|e| is_probed(e.name())) {
             let id = request.caller().correlation_id.ok_or(Errno::EIO)?;
             self.ids.lock().unwrap().admitted.insert(id);
         }
@@ -159,8 +167,10 @@ impl PathFilesystem for CorrelatingFs {
         name: &OsStr,
         caller: &Caller,
     ) -> Result<Option<PathEntry<()>>, Errno> {
-        let id = caller.correlation_id.ok_or(Errno::EIO)?;
-        self.ids.lock().unwrap().handled.push(id);
+        if is_probed(name) {
+            let id = caller.correlation_id.ok_or(Errno::EIO)?;
+            self.ids.lock().unwrap().handled.push(id);
+        }
         self.inner.lookup(parent, name, caller)
     }
 
@@ -181,13 +191,13 @@ fn check_mounted_request_correlation(threading: ThreadingMode) {
         inner: ReadOnlyPathFs::new(backing.path()),
         ids: Arc::clone(&ids),
     };
-    for file in ["first", "second"] {
+    for file in PROBED {
         std::fs::write(backing.path().join(file), []).unwrap();
     }
 
     with_mounted(filesystem, SessionConfig { threading }, |mounted_at| {
         thread::scope(|scope| {
-            for file in ["first", "second"] {
+            for file in PROBED {
                 scope.spawn(move || std::fs::metadata(mounted_at.join(file)).unwrap());
             }
         });
@@ -195,7 +205,14 @@ fn check_mounted_request_correlation(threading: ThreadingMode) {
         assert!(ids.handled.len() >= 2);
         let handled: HashSet<_> = ids.handled.iter().copied().collect();
         assert_eq!(handled.len(), ids.handled.len());
-        assert_eq!(handled, ids.admitted);
+        // Other processes may look up these names too, and such a lookup can
+        // be admitted but not yet handled when the lock is taken, so only
+        // require that every handled lookup reused its admission's ID.
+        assert!(
+            handled.is_subset(&ids.admitted),
+            "handled {handled:?} not all admitted {:?}",
+            ids.admitted
+        );
     });
 }
 
