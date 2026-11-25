@@ -1051,8 +1051,7 @@ mod tests {
         let caller = Caller {
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
-            pid: 0,
-            umask: 0,
+            ..Default::default()
         };
         assert!(owned_by_caller(&caller));
         set_ownership_path(Path::new("/nonexistent/typed-fuse"), &caller).unwrap();

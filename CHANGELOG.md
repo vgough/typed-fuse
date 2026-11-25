@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Mounted requests carry a session-local `Caller::correlation_id` through
+  admission and filesystem handlers. Complete `Caller` struct literals must
+  supply the field or use `..Default::default()`.
+
 ## 0.9.0
 
 ### Breaking changes

@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::ffi::OsStr;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use crate::attr::{FileKind, NodeAttr, SetAttr, StatFs};
@@ -28,13 +29,17 @@ impl NodeId {
     }
 }
 
-/// Credentials of the process that issued the current request.
+/// Credentials and correlation metadata for the current request.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Caller {
     pub uid: u32,
     pub gid: u32,
     pub pid: u32,
     pub umask: u32,
+    /// The session-local ID assigned by typed-fuse. Callbacks dispatched for
+    /// the same request share this ID. Direct runtime callers can supply one
+    /// or leave it unset. The ID does not indicate completion order.
+    pub correlation_id: Option<NonZeroU64>,
 }
 
 /// Connection parameters passed to [`NodeFs::init`], read from (and, for the
