@@ -2308,6 +2308,7 @@ impl<P: PathFilesystem> PathNodeFs<P> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Condvar, mpsc};
     use std::thread;
@@ -2409,6 +2410,7 @@ mod tests {
         releasedir_handles: Arc<Mutex<Vec<usize>>>,
         /// What `admit` saw of each request, in call order.
         admissions: Arc<Mutex<Vec<Admitted>>>,
+        lookup_ids: Arc<Mutex<Vec<Option<NonZeroU64>>>>,
     }
 
     /// What `admit` saw of one request.
@@ -2420,6 +2422,7 @@ mod tests {
         entries: Vec<(bool, OsString)>,
         xattr_name: Option<OsString>,
         offset: Option<u64>,
+        correlation_id: Option<NonZeroU64>,
     }
 
     impl Admitted {
@@ -2430,6 +2433,7 @@ mod tests {
                 entries: Vec::new(),
                 xattr_name: None,
                 offset: None,
+                correlation_id: None,
             }
         }
 
@@ -2472,6 +2476,7 @@ mod tests {
                 fsyncdir_handles: Arc::default(),
                 releasedir_handles: Arc::default(),
                 admissions: Arc::default(),
+                lookup_ids: Arc::default(),
             }
         }
     }
@@ -2498,6 +2503,7 @@ mod tests {
                     .collect(),
                 xattr_name: request.xattr_name().map(OsStr::to_os_string),
                 offset: request.offset(),
+                correlation_id: request.caller().correlation_id,
             });
             Ok(())
         }
@@ -2506,8 +2512,9 @@ mod tests {
             &self,
             _parent: PathNodeRef<'_, Self::NodeState>,
             name: &OsStr,
-            _caller: &Caller,
+            caller: &Caller,
         ) -> Result<Option<PathEntry<Self::NodeState>>, Errno> {
+            mutex(&self.lookup_ids).push(caller.correlation_id);
             if mutex(&self.failing_lookups).contains(name) {
                 return Err(Errno::EIO);
             }
@@ -2901,6 +2908,23 @@ mod tests {
                 .entries()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn admission_and_lookup_share_the_dispatchers_correlation_id() {
+        let fs = RecordingFs::default();
+        let admissions = Arc::clone(&fs.admissions);
+        let lookup_ids = Arc::clone(&fs.lookup_ids);
+        let runtime = Runtime::new(PathNodeFs::new(fs));
+        let caller = Caller {
+            correlation_id: NonZeroU64::new(42),
+            ..Caller::default()
+        };
+
+        found(runtime.lookup(1, OsStr::new("file"), &caller).unwrap());
+
+        assert_eq!(mutex(&admissions)[0].correlation_id, caller.correlation_id);
+        assert_eq!(*mutex(&lookup_ids), [caller.correlation_id]);
     }
 
     #[test]

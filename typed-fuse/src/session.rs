@@ -27,15 +27,17 @@
 //! level, libfuse actually passes a vanilla `stat*`, which `setattr_shim`
 //! reinterprets.
 
+use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr};
 use std::marker::PhantomData;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::ptr;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use libfuse_sys::fuse_lowlevel::{
@@ -144,21 +146,49 @@ fn raw_reply_statfs(req: fuse_req_t, stbuf: *const statvfs) -> c_int {
 // Holder recovery + shared helpers
 // ---------------------------------------------------------------------
 
-/// Recovers the `Runtime<F>` associated with an in-flight request. Sound
-/// because `fuse_session_loop` processes requests sequentially (see module
-/// docs).
-fn holder_of<'a, F: NodeFs>(req: fuse_req_t) -> &'a Runtime<F> {
-    unsafe { &*(fuse_req_userdata(req) as *const Runtime<F>) }
+struct SessionState<F: NodeFs> {
+    runtime: Runtime<F>,
+    next_correlation_id: AtomicU64,
 }
 
-/// Extracts the calling process's credentials from a request.
-fn caller_of(req: fuse_req_t) -> Caller {
+impl<F: NodeFs> SessionState<F> {
+    fn allocate_correlation_id(&self) -> Option<NonZeroU64> {
+        // After u64::MAX the counter stays at zero, so an ID is never reused.
+        let mut next = self.next_correlation_id.load(Ordering::Relaxed);
+        loop {
+            let id = NonZeroU64::new(next)?;
+            match self.next_correlation_id.compare_exchange_weak(
+                next,
+                next.wrapping_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(id),
+                Err(current) => next = current,
+            }
+        }
+    }
+}
+
+/// The session owns this state until after libfuse has finished dispatching
+/// callbacks and destroyed the session.
+fn state_of<'a, F: NodeFs>(req: fuse_req_t) -> &'a SessionState<F> {
+    unsafe { &*fuse_req_userdata(req).cast::<SessionState<F>>() }
+}
+
+fn holder_of<'a, F: NodeFs>(req: fuse_req_t) -> &'a Runtime<F> {
+    &state_of::<F>(req).runtime
+}
+
+/// Builds the caller metadata once per request at the dispatch boundary.
+fn caller_of<F: NodeFs>(req: fuse_req_t, state: &SessionState<F>) -> Caller {
     let ctx: &fuse_ctx = unsafe { &*fuse_req_ctx(req) };
     Caller {
         uid: ctx.uid as u32,
         gid: ctx.gid as u32,
         pid: ctx.pid as u32,
         umask: ctx.umask as u32,
+        correlation_id: state.allocate_correlation_id(),
     }
 }
 
@@ -194,8 +224,9 @@ fn call_fs<F: NodeFs, R>(
     req: fuse_req_t,
     f: impl FnOnce(&Runtime<F>, &Caller) -> Result<R, Errno>,
 ) -> Result<R, Errno> {
-    let rt = holder_of::<F>(req);
-    let caller = caller_of(req);
+    let state = state_of::<F>(req);
+    let rt = &state.runtime;
+    let caller = caller_of(req, state);
     catch_unwind(move || f(rt, &caller))
 }
 
@@ -259,14 +290,14 @@ fn reply_xattr(req: fuse_req_t, reply: &XattrReply, requested_size: usize) {
 // ---------------------------------------------------------------------
 
 unsafe extern "C" fn init_shim<F: NodeFs>(userdata: *mut c_void, conn: *mut fuse_conn_info) {
-    let rt = unsafe { &*(userdata as *const Runtime<F>) };
+    let rt = unsafe { &(*userdata.cast::<SessionState<F>>()).runtime };
     let mut info = conn_read(conn);
     catch_unwind_unit(|| rt.init(&mut info));
     conn_apply(conn, &info);
 }
 
 unsafe extern "C" fn destroy_shim<F: NodeFs>(userdata: *mut c_void) {
-    let rt = unsafe { &*(userdata as *const Runtime<F>) };
+    let rt = unsafe { &(*userdata.cast::<SessionState<F>>()).runtime };
     catch_unwind_unit(|| rt.destroy());
 }
 
@@ -486,19 +517,31 @@ unsafe extern "C" fn read_shim<F: NodeFs>(
     fi: *mut fuse_file_info,
 ) {
     let fh = fi_fh(fi);
-    let rt = holder_of::<F>(req);
-    let caller = caller_of(req);
+    let state = state_of::<F>(req);
+    let rt = &state.runtime;
+    let caller = caller_of(req, state);
+    // Any reply frees `req`, and `Runtime::read` releases its leases after
+    // the reply runs, so a panic can arrive after `req` is gone. Only the
+    // reply closure itself may answer once it has started.
+    let replied = Cell::new(false);
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        rt.read(ino, fh, off as u64, size, &caller, |result| match result {
-            Ok(data) => {
-                let len = data.len().min(size);
-                unsafe { fuse_reply_buf(req, data[..len].as_ptr() as *const c_char, len) };
+        rt.read(ino, fh, off as u64, size, &caller, |result| {
+            replied.set(true);
+            match result {
+                Ok(data) => {
+                    let len = data.len().min(size);
+                    unsafe { fuse_reply_buf(req, data[..len].as_ptr() as *const c_char, len) };
+                }
+                Err(e) => reply_err(req, e),
             }
-            Err(e) => reply_err(req, e),
         })
     }));
     if result.is_err() {
-        reply_err(req, Errno::EIO);
+        if replied.get() {
+            eprintln!("fuse3: read panicked after replying; the reply already sent stands");
+        } else {
+            reply_err(req, Errno::EIO);
+        }
     }
 }
 
@@ -610,8 +653,8 @@ unsafe extern "C" fn readdirplus_shim<F: NodeFs>(
         rt.readdirplus(ino, fh, off as u64, &mut buf, c)
     }) {
         Ok(retained) => {
+            let rt = holder_of::<F>(req);
             if reply_dir_buf(req, buf.as_slice()) != 0 {
-                let rt = holder_of::<F>(req);
                 for id in retained {
                     rt.forget(id.ino(), 1);
                 }
@@ -1214,7 +1257,7 @@ impl Drop for LoopConfig {
 /// `!Send`; libfuse worker threads only share its synchronized runtime.
 pub struct Session<F: NodeFs> {
     session: *mut fuse_session,
-    runtime: *mut Runtime<F>,
+    state: *mut SessionState<F>,
     mounted: bool,
     _arg_storage: Vec<CString>,
     config: SessionConfig,
@@ -1262,7 +1305,10 @@ impl<F: NodeFs> Session<F> {
         let mut runtime_value = Runtime::new(fs);
         runtime_value
             .set_parallel_dirops(matches!(config.threading, ThreadingMode::MultiThreaded(_)));
-        let runtime: *mut Runtime<F> = Box::into_raw(Box::new(runtime_value));
+        let state = Box::into_raw(Box::new(SessionState {
+            runtime: runtime_value,
+            next_correlation_id: AtomicU64::new(1),
+        }));
 
         #[cfg(target_os = "macos")]
         let session = unsafe {
@@ -1279,7 +1325,7 @@ impl<F: NodeFs> Session<F> {
                 &ops,
                 std::mem::size_of::<fuse_lowlevel_ops>(),
                 &mut version,
-                runtime as *mut c_void,
+                state.cast::<c_void>(),
             )
         };
         #[cfg(all(not(target_os = "macos"), has_session_new_versioned))]
@@ -1297,7 +1343,7 @@ impl<F: NodeFs> Session<F> {
                 &ops,
                 std::mem::size_of::<fuse_lowlevel_ops>(),
                 &mut version,
-                runtime as *mut c_void,
+                state.cast::<c_void>(),
             )
         };
         #[cfg(not(any(target_os = "macos", has_session_new_versioned)))]
@@ -1306,20 +1352,20 @@ impl<F: NodeFs> Session<F> {
                 &mut args,
                 &ops,
                 std::mem::size_of::<fuse_lowlevel_ops>(),
-                runtime as *mut c_void,
+                state.cast::<c_void>(),
             )
         };
 
         unsafe { fuse_opt_free_args(&mut args) };
 
         if session.is_null() {
-            unsafe { drop(Box::from_raw(runtime)) };
+            unsafe { drop(Box::from_raw(state)) };
             return Err(Error::SessionNew);
         }
 
         Ok(Session {
             session,
-            runtime,
+            state,
             mounted: false,
             _arg_storage: arg_cstrings,
             config,
@@ -1400,7 +1446,7 @@ impl<F: NodeFs> Drop for Session<F> {
                 fuse_session_unmount(self.session);
             }
             fuse_session_destroy(self.session);
-            drop(Box::from_raw(self.runtime));
+            drop(Box::from_raw(self.state));
         }
     }
 }
@@ -1429,6 +1475,41 @@ mod tests {
         fn getattr(&self, _n: &(), _h: Option<&()>, _c: &Caller) -> Result<NodeAttr, Errno> {
             Ok(NodeAttr::default())
         }
+    }
+
+    #[test]
+    fn concurrent_dispatch_allocates_distinct_correlation_ids() {
+        let state = SessionState {
+            runtime: Runtime::new(NullFs),
+            next_correlation_id: AtomicU64::new(1),
+        };
+        let ids = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..128)
+                            .map(|_| state.allocate_correlation_id().unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+        });
+        assert_eq!(ids.len(), 512);
+    }
+
+    #[test]
+    fn correlation_ids_do_not_wrap() {
+        let state = SessionState {
+            runtime: Runtime::new(NullFs),
+            next_correlation_id: AtomicU64::new(u64::MAX),
+        };
+        assert_eq!(state.allocate_correlation_id(), NonZeroU64::new(u64::MAX));
+        assert_eq!(state.allocate_correlation_id(), None);
+        assert_eq!(state.allocate_correlation_id(), None);
     }
 
     #[test]
